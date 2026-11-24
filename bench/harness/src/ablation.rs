@@ -24,23 +24,71 @@ pub struct AblationRow {
 
 pub fn nine_stage_ablation_matrix() -> Vec<AblationStage> {
     let base = PipelineFlags::none();
-    let s1 = PipelineFlags { prefix_lock: true, ..base };
-    let s2 = PipelineFlags { diet_gc: true, ..s1 };
-    let s3 = PipelineFlags { llmlingua_prose: true, ..s2 };
-    let s4 = PipelineFlags { tron_codec: true, ..s3 };
-    let s5 = PipelineFlags { optical_history: true, ..s4 };
-    let s6 = PipelineFlags { economizer_gates: true, ..s5 };
-    let s7 = PipelineFlags { ast_block_priming: true, ..s6 };
+    let s1 = PipelineFlags {
+        prefix_lock: true,
+        ..base
+    };
+    let s2 = PipelineFlags {
+        diet_gc: true,
+        ..s1
+    };
+    let s3 = PipelineFlags {
+        llmlingua_prose: true,
+        ..s2
+    };
+    let s4 = PipelineFlags {
+        tron_codec: true,
+        ..s3
+    };
+    let s5 = PipelineFlags {
+        optical_history: true,
+        ..s4
+    };
+    let s6 = PipelineFlags {
+        economizer_gates: true,
+        ..s5
+    };
+    let s7 = PipelineFlags {
+        ast_block_priming: true,
+        ..s6
+    };
     vec![
-        AblationStage { name: "Baseline", flags: base },
-        AblationStage { name: "+PrefixLock", flags: s1 },
-        AblationStage { name: "+AgentDiet_GC", flags: s2 },
-        AblationStage { name: "+LLMLingua_Prose", flags: s3 },
-        AblationStage { name: "+TRON_Codec", flags: s4 },
-        AblationStage { name: "+AgentOCR_History", flags: s5 },
-        AblationStage { name: "+TokenEconomizer_Gates", flags: s6 },
-        AblationStage { name: "+AST_Block_Priming", flags: s7 },
-        AblationStage { name: "Full Symbiotic", flags: PipelineFlags::all() },
+        AblationStage {
+            name: "Baseline",
+            flags: base,
+        },
+        AblationStage {
+            name: "+PrefixLock",
+            flags: s1,
+        },
+        AblationStage {
+            name: "+AgentDiet_GC",
+            flags: s2,
+        },
+        AblationStage {
+            name: "+LLMLingua_Prose",
+            flags: s3,
+        },
+        AblationStage {
+            name: "+TRON_Codec",
+            flags: s4,
+        },
+        AblationStage {
+            name: "+AgentOCR_History",
+            flags: s5,
+        },
+        AblationStage {
+            name: "+TokenEconomizer_Gates",
+            flags: s6,
+        },
+        AblationStage {
+            name: "+AST_Block_Priming",
+            flags: s7,
+        },
+        AblationStage {
+            name: "Full Symbiotic",
+            flags: PipelineFlags::all(),
+        },
     ]
 }
 
@@ -147,7 +195,24 @@ fn extract_model(raw: &[u8]) -> String {
 }
 
 fn extract_tools(raw: &[u8]) -> Option<Value> {
-    serde_json::from_slice::<Value>(raw)
-        .ok()
-        .and_then(|v| v.get("tools").cloned())
+    let mut val = serde_json::from_slice::<Value>(raw)
+        .ok()?
+        .get("tools")?
+        .clone();
+    if let Some(arr) = val.as_array_mut() {
+        arr.sort_by(|a, b| {
+            let na = a
+                .pointer("/function/name")
+                .or_else(|| a.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let nb = b
+                .pointer("/function/name")
+                .or_else(|| b.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            na.cmp(nb)
+        });
+    }
+    Some(val)
 }

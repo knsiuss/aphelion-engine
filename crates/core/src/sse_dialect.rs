@@ -106,7 +106,11 @@ fn handle_openai_chunk(
         .and_then(Value::as_str)
     {
         fsm.ingest_reasoning_delta(reasoning.as_bytes(), session);
-        if root.pointer("/choices/0/delta/content").and_then(Value::as_str).is_none() {
+        if root
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+            .is_none()
+        {
             return raw_frame.to_vec();
         }
     }
@@ -140,29 +144,32 @@ fn handle_anthropic_event(
     raw_frame: &[u8],
     session: &mut SessionState,
 ) -> Vec<u8> {
-    if ev_type == "message_start" {
-        if let Some(msg) = root.get("message") {
-            if let Some(u) = extract_usage_universal(msg) {
+    match ev_type {
+        "message_start" => {
+            if let Some(u) = root.get("message").and_then(extract_usage_universal) {
                 session.last_usage = Some(u);
             }
+            return raw_frame.to_vec();
         }
-        return raw_frame.to_vec();
-    }
-    if ev_type == "message_delta" {
-        if let Some(out_tok) = root.pointer("/usage/output_tokens").and_then(Value::as_u64) {
-            let entry = session.last_usage.get_or_insert_with(UpstreamUsage::default);
-            entry.output_tokens = out_tok as usize;
+        "message_delta" => {
+            if let Some(out_tok) = root.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                session
+                    .last_usage
+                    .get_or_insert_with(UpstreamUsage::default)
+                    .output_tokens = out_tok as usize;
+            }
+            return raw_frame.to_vec();
         }
-        return raw_frame.to_vec();
-    }
-    if ev_type == "message_stop" {
-        return flush_before_terminal(fsm, session, raw_frame, true);
-    }
-    if ev_type != "content_block_delta" {
-        return raw_frame.to_vec();
+        "message_stop" => return flush_before_terminal(fsm, session, raw_frame, true),
+        "content_block_delta" => {}
+        _ => return raw_frame.to_vec(),
     }
 
-    match root.pointer("/delta/type").and_then(Value::as_str).unwrap_or_default() {
+    match root
+        .pointer("/delta/type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
         "thinking_delta" => {
             if let Some(thinking) = root.pointer("/delta/thinking").and_then(Value::as_str) {
                 fsm.ingest_reasoning_delta(thinking.as_bytes(), session);
@@ -176,7 +183,10 @@ fn handle_anthropic_event(
         }
         "text_delta" => {
             fsm.finalize_reasoning_if_active(session);
-            let Some(text) = root.pointer("/delta/text").and_then(Value::as_str).map(str::to_owned)
+            let Some(text) = root
+                .pointer("/delta/text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
             else {
                 return raw_frame.to_vec();
             };

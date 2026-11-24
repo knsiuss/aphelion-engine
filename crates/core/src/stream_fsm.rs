@@ -46,7 +46,8 @@ impl StreamFsm {
             if self.sse_line_buf.first() == Some(&b'{') {
                 if let Some(nl) = self.sse_line_buf.iter().position(|&b| b == b'\n') {
                     let frame: Vec<u8> = self.sse_line_buf.drain(..=nl).collect();
-                    output.extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
+                    output
+                        .extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
                     continue;
                 }
                 break;

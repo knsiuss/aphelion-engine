@@ -1,6 +1,7 @@
 use crate::headers::extract_model;
 use crate::proxy::ProxyState;
 use aphelion_core::patcher::reconstruct_from_patch;
+use aphelion_core::prefix_ledger::PrefixLedger;
 use aphelion_core::stream_fsm::StreamFsm;
 use aphelion_core::types::{ExecutionProfile, SlmRouteDecision, UpstreamUsage};
 use aphelion_telemetry::audit::AuditRecord;
@@ -38,11 +39,34 @@ pub fn prepare_outbound(state: &ProxyState, raw_body: &[u8]) -> (Vec<u8>, Option
         return (raw_body.to_vec(), None);
     };
     guard.last_usage = None;
+
+    // Restore persisted PrefixLedger entry from SQLite if present.
+    if let (Some(sid), Some(audit_lock)) = (guard.session_id, &state.audit) {
+        let key = PrefixLedger::active_key(Some(sid), &model);
+        if guard.prefix_ledger.get(&key).is_none() {
+            if let Ok(db) = audit_lock.lock() {
+                if let Some(saved) = db.load_prefix_record(&key) {
+                    guard.prefix_ledger.restore_record(key, saved);
+                }
+            }
+        }
+    }
+
     let Ok(transformed) =
         aphelion_core::prepare_request(raw_body, ExecutionProfile::Ephemeral, &mut guard)
     else {
         return (raw_body.to_vec(), None);
     };
+
+    if let Some(audit_lock) = &state.audit {
+        let key = PrefixLedger::active_key(guard.session_id, &model);
+        if let Some(rec) = guard.prefix_ledger.get(&key) {
+            if let Ok(db) = audit_lock.lock() {
+                let _ = db.save_prefix_record(&key, rec);
+            }
+        }
+    }
+
     let opt_tok = count_payload_tokens(&model, &transformed.body);
     let fallback_cache = if guard.turn_index > 1 {
         count_payload_tokens(&model, &guard.frozen_prefix_bytes)
@@ -81,6 +105,28 @@ pub fn finalize_turn(
     } else {
         turn.fallback_cache_read
     };
+    let uncached = if u.input_tokens > 0 {
+        u.uncached_input_tokens
+    } else {
+        turn.opt_tokens.saturating_sub(cache_read)
+    };
+
+    let mut breaker_tripped = false;
+    if let Ok(mut guard) = state.session.lock() {
+        if u.input_tokens > 0 {
+            guard.record_upstream_usage(&u);
+        }
+        let key = PrefixLedger::active_key(guard.session_id, &turn.model);
+        if let Some(rec) = guard.prefix_ledger.get(&key) {
+            breaker_tripped = rec.cache_drop_breaker_tripped;
+            if let Some(audit_lock) = &state.audit {
+                if let Ok(db) = audit_lock.lock() {
+                    let _ = db.save_prefix_record(&key, rec);
+                }
+            }
+        }
+    }
+
     let tel = TurnTelemetry {
         raw_input_tokens: turn.raw_tokens,
         opt_input_tokens: turn.opt_tokens,
@@ -103,6 +149,7 @@ pub fn finalize_turn(
                 model: turn.model,
                 raw_tokens: turn.raw_tokens,
                 opt_tokens: turn.opt_tokens,
+                uncached_input_tokens: uncached,
                 cache_read_tokens: cache_read,
                 cache_creation_tokens: u.cache_creation_tokens,
                 output_tokens: u.output_tokens,
@@ -112,6 +159,7 @@ pub fn finalize_turn(
                 c_eff_usd: c_eff,
                 slm_routed: turn.slm_routed,
                 circuit_breaker_tripped: turn.circuit_breaker_tripped,
+                cache_drop_breaker_tripped: breaker_tripped,
                 prompt_text: turn.prompt_text,
                 response_text,
             });

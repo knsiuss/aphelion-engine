@@ -76,12 +76,35 @@ pub async fn run_live_ab(
     println!("\n### Live Shadow A/B Report ({upstream})");
     println!("| Metric | Control (Raw) | Treatment (Aphelion) |");
     println!("| :--- | ---: | ---: |");
-    println!("| Verified Cached Tokens | {} | {} |", control.cached_tokens, treatment.cached_tokens);
-    println!("| Latency p50 / p95 (ms) | {} / {} | {} / {} |", control.p50_ms(), control.p95_ms(), treatment.p50_ms(), treatment.p95_ms());
-    println!("| Reasoning-to-Action (rho_RA) | {:.2} | {:.2} |", control.rho_ra(), treatment.rho_ra());
-    println!("| Hedge Density (per 100 tok) | {:.2} | {:.2} |", control.hedge_density(), treatment.hedge_density());
-    println!("| AST Syntax Errors | {} | {} |", control.ast_errors, treatment.ast_errors);
-    println!("| Invalid Tool-Call JSON | {} | {} |", control.invalid_tool_json, treatment.invalid_tool_json);
+    println!(
+        "| Verified Cached Tokens | {} | {} |",
+        control.cached_tokens, treatment.cached_tokens
+    );
+    println!(
+        "| Latency p50 / p95 (ms) | {} / {} | {} / {} |",
+        control.p50_ms(),
+        control.p95_ms(),
+        treatment.p50_ms(),
+        treatment.p95_ms()
+    );
+    println!(
+        "| Reasoning-to-Action (rho_RA) | {:.2} | {:.2} |",
+        control.rho_ra(),
+        treatment.rho_ra()
+    );
+    println!(
+        "| Hedge Density (per 100 tok) | {:.2} | {:.2} |",
+        control.hedge_density(),
+        treatment.hedge_density()
+    );
+    println!(
+        "| AST Syntax Errors | {} | {} |",
+        control.ast_errors, treatment.ast_errors
+    );
+    println!(
+        "| Invalid Tool-Call JSON | {} | {} |",
+        control.invalid_tool_json, treatment.invalid_tool_json
+    );
 }
 
 async fn execute_arm(
@@ -119,13 +142,20 @@ async fn execute_arm(
         metrics.reasoning_tokens += u.reasoning_tokens;
         metrics.action_tokens += u.output_tokens.saturating_sub(u.reasoning_tokens);
     }
-    if let Some(text) = json.pointer("/choices/0/message/content").and_then(Value::as_str) {
+    if let Some(text) = json
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+    {
         metrics.hedges += count_self_doubt_hedges(text);
-        if text.contains("```rust\n") && !validate_syntax(CodeLang::Rust, extract_rust_block(text)) {
+        if text.contains("```rust\n") && !validate_syntax(CodeLang::Rust, extract_rust_block(text))
+        {
             metrics.ast_errors += 1;
         }
     }
-    if let Some(calls) = json.pointer("/choices/0/message/tool_calls").and_then(Value::as_array) {
+    if let Some(calls) = json
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    {
         for c in calls {
             if let Some(args) = c.pointer("/function/arguments").and_then(Value::as_str) {
                 if serde_json::from_str::<Value>(args).is_err() {

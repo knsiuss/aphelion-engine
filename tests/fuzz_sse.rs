@@ -44,10 +44,20 @@ fn sse_one_byte_and_random_fragmentation_matches_whole_stream() {
     let mut s_rand = SessionState::default();
     let random = feed_chunked_sse(wire.as_bytes(), &[1, 3, 2, 7, 1, 5, 13, 2], &mut s_rand);
 
-    assert_eq!(whole, one_byte, "1-byte SSE fragmentation must be byte-identical");
-    assert_eq!(whole, random, "random SSE fragmentation must be byte-identical");
+    assert_eq!(
+        whole, one_byte,
+        "1-byte SSE fragmentation must be byte-identical"
+    );
+    assert_eq!(
+        whole, random,
+        "random SSE fragmentation must be byte-identical"
+    );
     assert_eq!(s_whole.last_thought_anchor, s_one.last_thought_anchor);
-    assert!(s_one.last_thought_anchor.as_deref().unwrap_or("").contains("Verified exact fix"));
+    assert!(s_one
+        .last_thought_anchor
+        .as_deref()
+        .unwrap_or("")
+        .contains("Verified exact fix"));
 }
 
 #[test]
@@ -86,7 +96,8 @@ fn invariant_1_prefix_immutability_and_cache_control_guard() {
         "messages": [{"role": "user", "content": "Hello"}]
     }))
     .unwrap();
-    let out0 = aphelion_core::prepare_request(&t0, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out0 =
+        aphelion_core::prepare_request(&t0, ExecutionProfile::Ephemeral, &mut state).unwrap();
     let frozen = state.frozen_prefix_len;
     assert!(frozen > 0);
 
@@ -100,7 +111,8 @@ fn invariant_1_prefix_immutability_and_cache_control_guard() {
         ]
     }))
     .unwrap();
-    let out1 = aphelion_core::prepare_request(&t1, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out1 =
+        aphelion_core::prepare_request(&t1, ExecutionProfile::Ephemeral, &mut state).unwrap();
     assert!(verify_prefix_invariant(&out0.body, &out1.body, frozen));
     assert!(state.turn_alias.is_some());
 
@@ -113,17 +125,23 @@ fn invariant_1_prefix_immutability_and_cache_control_guard() {
         "messages": [{"role": "user", "content": "Hello"}]
     }))
     .unwrap();
-    let anth_out = aphelion_core::prepare_request(&anth_t0, ExecutionProfile::Ephemeral, &mut anth_state).unwrap();
+    let anth_out =
+        aphelion_core::prepare_request(&anth_t0, ExecutionProfile::Ephemeral, &mut anth_state)
+            .unwrap();
     assert!(anth_state.sacred_cache_boundary > 0);
-    assert!(verify_prefix_invariant(&anth_t0, &anth_out.body, anth_state.frozen_prefix_len));
+    assert!(verify_prefix_invariant(
+        &anth_t0,
+        &anth_out.body,
+        anth_state.frozen_prefix_len
+    ));
 }
 
 #[test]
 fn invariant_2_tool_loop_preserves_tools_and_suppresses_prefill() {
     let mut state = SessionState::default();
     let tools = json!([
-        {"type": "function", "function": {"name": "read_file", "description": "Read a file"}},
-        {"type": "function", "function": {"name": "edit_file", "description": "Edit a file"}}
+        {"type": "function", "function": {"name": "edit_file", "description": "Edit a file"}},
+        {"type": "function", "function": {"name": "read_file", "description": "Read a file"}}
     ]);
     let req = serde_json::to_vec(&json!({
         "model": "gpt-4o",
@@ -131,7 +149,8 @@ fn invariant_2_tool_loop_preserves_tools_and_suppresses_prefill() {
         "messages": [{"role": "user", "content": "Read file src/main.rs"}]
     }))
     .unwrap();
-    let out = aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out =
+        aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     let parsed: Value = serde_json::from_slice(&out.body).unwrap();
     assert_eq!(parsed["tools"], tools);
     assert!(!out.metrics.prefill_injected);
@@ -175,12 +194,14 @@ fn invariant_6_error_and_circuit_breaker_force_deep_and_disable_prefill() {
         ]
     }))
     .unwrap();
-    let out1 = aphelion_core::prepare_request(&err_req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out1 =
+        aphelion_core::prepare_request(&err_req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     assert!(out1.metrics.complexity_deep);
     assert!(!out1.metrics.prefill_injected);
     assert!(!out1.metrics.stage_stats.circuit_breaker_tripped);
 
-    let out2 = aphelion_core::prepare_request(&err_req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out2 =
+        aphelion_core::prepare_request(&err_req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     assert!(out2.metrics.complexity_deep);
     assert!(out2.metrics.stage_stats.circuit_breaker_tripped);
 }
@@ -188,7 +209,8 @@ fn invariant_6_error_and_circuit_breaker_force_deep_and_disable_prefill() {
 #[test]
 fn ephemeral_latency_budget_50kb_payload() {
     let mut state = SessionState::default();
-    let big_prose = "This is a realistic coding agent context paragraph with identifiers. ".repeat(750);
+    let big_prose =
+        "This is a realistic coding agent context paragraph with identifiers. ".repeat(750);
     let payload = serde_json::to_vec(&json!({
         "model": "gpt-4o",
         "system": "You are a helpful coding assistant.",
@@ -197,9 +219,13 @@ fn ephemeral_latency_budget_50kb_payload() {
     .unwrap();
     assert!(payload.len() >= 50_000);
     let start = std::time::Instant::now();
-    let out = aphelion_core::prepare_request(&payload, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out =
+        aphelion_core::prepare_request(&payload, ExecutionProfile::Ephemeral, &mut state).unwrap();
     let elapsed_ms = start.elapsed().as_millis();
     assert!(!out.body.is_empty());
     // Debug builds are slower than release; verify well under 100ms in debug (<3ms in release).
-    assert!(elapsed_ms < 100, "unexpectedly slow transform: {elapsed_ms}ms");
+    assert!(
+        elapsed_ms < 100,
+        "unexpectedly slow transform: {elapsed_ms}ms"
+    );
 }

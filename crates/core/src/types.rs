@@ -1,3 +1,4 @@
+use crate::prefix_ledger::PrefixLedger;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -104,10 +105,13 @@ pub enum SlmRouteDecision {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StageStats {
     pub diet_gc_compacted_tokens: usize,
+    pub ingress_saved_tokens: usize,
     pub optical_tiles_emitted: usize,
     pub prose_pruned_tokens: usize,
     pub tron_tables_encoded: usize,
     pub circuit_breaker_tripped: bool,
+    pub cache_drop_breaker_active: bool,
+    pub macro_compaction_triggered: bool,
     pub micro_skill_injected: Option<String>,
     pub blocks_anchored: usize,
     pub validator_rollback: bool,
@@ -116,6 +120,7 @@ pub struct StageStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamUsage {
     pub input_tokens: usize,
+    pub uncached_input_tokens: usize,
     pub output_tokens: usize,
     pub cached_tokens: usize,
     pub cache_creation_tokens: usize,
@@ -137,16 +142,32 @@ pub struct SessionState {
     pub recent_error_sigs: Vec<u64>,
     pub workflow_counts: HashMap<u64, u32>,
     pub active_micro_skill: Option<String>,
+    pub prefix_ledger: PrefixLedger,
+    pub active_model: String,
+}
+
+impl SessionState {
+    pub fn record_upstream_usage(&mut self, usage: &UpstreamUsage) {
+        let key = PrefixLedger::active_key(self.session_id, &self.active_model);
+        let rec = self.prefix_ledger.get_or_insert_mut(key);
+        rec.record_usage(
+            usage.input_tokens,
+            usage.cached_tokens,
+            usage.cache_creation_tokens,
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NormalizedRequest {
     pub dialect: Dialect,
     pub workload: WorkloadClass,
+    pub model_id: String,
     pub root: Value,
     pub raw_passthrough: Option<Vec<u8>>,
     pub sacred_boundary: usize,
     pub is_turn_zero: bool,
+    pub ingress_start: usize,
     pub active_tool_loop: bool,
     pub complexity: Complexity,
     pub supports_prefill: bool,

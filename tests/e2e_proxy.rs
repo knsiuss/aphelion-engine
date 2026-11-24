@@ -1,5 +1,4 @@
 use aphelion_cli::proxy::{run_proxy_server, ProxyState};
-use aphelion_cli::spawn::{resolve_windows_executable, ResolvedExec};
 use aphelion_core::canonicalizer::verify_prefix_invariant;
 use aphelion_telemetry::audit::AuditLedger;
 use bytes::Bytes;
@@ -17,12 +16,30 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
+fn resp_json(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+fn resp_sse(body: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
 async fn spawn_mock_upstream(captured: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
             let cap = Arc::clone(&captured);
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
@@ -31,44 +48,30 @@ async fn spawn_mock_upstream(captured: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
                         let path = req.uri().path().to_owned();
                         let body = req.into_body().collect().await.unwrap().to_bytes();
                         cap.lock().unwrap().push(body.to_vec());
-
                         if path.contains("rate-limit") {
-                            return Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::TOO_MANY_REQUESTS)
-                                    .header("content-type", "application/json")
-                                    .body(Full::new(Bytes::from(r#"{"error":"rate_limited"}"#)))
-                                    .unwrap(),
-                            );
+                            return Ok::<_, Infallible>(resp_json(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                r#"{"error":"rate_limited"}"#,
+                            ));
                         }
                         if path.contains("/v1/models") {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/json")
-                                .body(Full::new(Bytes::from(r#"{"data":[{"id":"gpt-4o"}]}"#)))
-                                .unwrap());
+                            return Ok(resp_json(StatusCode::OK, r#"{"data":[{"id":"gpt-4o"}]}"#));
                         }
                         if path.contains("/non-stream") {
-                            let body = r#"{"choices":[{"message":{"role":"assistant","content":"Non-stream ok"}}],"usage":{"prompt_tokens":100,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":80}}}"#;
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/json")
-                                .body(Full::new(Bytes::from(body)))
-                                .unwrap());
+                            return Ok(resp_json(
+                                StatusCode::OK,
+                                r#"{"choices":[{"message":{"role":"assistant","content":"Non-stream ok"}}],"usage":{"prompt_tokens":100,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":80}}}"#,
+                            ));
                         }
                         if path.contains("/v1/messages") {
                             let sse = concat!(
-                                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":500,\"cache_read_input_tokens\":400,\"cache_creation_input_tokens\":0}}}\n\n",
+                                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":400,\"cache_creation_input_tokens\":0}}}\n\n",
                                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checked AST. Ready to patch.\"}}\n\n",
                                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"lib.rs\\\"}\"}}\n\n",
                                 "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
                                 "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
                             );
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/event-stream")
-                                .body(Full::new(Bytes::from(sse)))
-                                .unwrap());
+                            return Ok(resp_sse(sse));
                         }
                         let sse = concat!(
                             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Verified fix. Applying update.\"}}]}\n\n",
@@ -76,14 +79,12 @@ async fn spawn_mock_upstream(captured: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
                             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":300,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":220},\"completion_tokens_details\":{\"reasoning_tokens\":10}}}\n\n",
                             "data: [DONE]\n\n"
                         );
-                        Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "text/event-stream")
-                            .body(Full::new(Bytes::from(sse)))
-                            .unwrap())
+                        Ok(resp_sse(sse))
                     }
                 });
-                let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await;
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
             });
         }
     });
@@ -116,7 +117,12 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
         "messages": [{"role": "user", "content": "Hello"}]
     }))
     .unwrap();
-    let r0 = client.post(format!("{base}/v1/chat/completions")).body(t0).send().await.unwrap();
+    let r0 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .body(t0)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r0.status(), 200);
     assert!(r0.text().await.unwrap().contains("Done!"));
 
@@ -159,13 +165,23 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
         "messages": [{"role": "user", "content": "Check lib.rs"}]
     }))
     .unwrap();
-    let r_anth = client.post(format!("{base}/v1/messages")).body(anth_body).send().await.unwrap();
+    let r_anth = client
+        .post(format!("{base}/v1/messages"))
+        .body(anth_body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r_anth.status(), 200);
     let anth_text = r_anth.text().await.unwrap();
     assert!(anth_text.contains("input_json_delta"));
 
     // 3. Upstream 429 pass-through without crashing or hanging
-    let r_429 = client.post(format!("{base}/v1/rate-limit")).body("{}").send().await.unwrap();
+    let r_429 = client
+        .post(format!("{base}/v1/rate-limit"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r_429.status(), 429);
     assert!(r_429.text().await.unwrap().contains("rate_limited"));
 
@@ -186,7 +202,11 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
     assert_eq!(r_ns.status(), 200);
     assert!(r_ns.text().await.unwrap().contains("Non-stream ok"));
 
-    let r_models = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let r_models = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r_models.status(), 200);
     assert!(r_models.text().await.unwrap().contains("gpt-4o"));
 
@@ -202,28 +222,16 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
     assert_eq!(captured.lock().unwrap().last().unwrap(), raw_bypass);
 
     // 5. Verify SQLite Flight Recorder persisted real upstream cached_tokens & usage
-    let audit_sum = state.audit.as_ref().unwrap().lock().unwrap().summarize().unwrap();
+    let audit_sum = state
+        .audit
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .summarize()
+        .unwrap();
     assert_eq!(audit_sum.total_requests, 4);
     assert!(audit_sum.total_cache_read_tokens >= 920);
 
     server.abort();
-}
-
-#[test]
-fn windows_pathext_resolves_exe_cmd_and_ps1_priority() {
-    let dir = std::env::temp_dir().join("aphelion_pathext_test");
-    let _ = std::fs::create_dir_all(&dir);
-    let cmd_file = dir.join("opencode.cmd");
-    let ps1_file = dir.join("claude.ps1");
-    let exe_file = dir.join("aider.exe");
-    std::fs::write(&cmd_file, "@echo off").unwrap();
-    std::fs::write(&ps1_file, "Write-Host hi").unwrap();
-    std::fs::write(&exe_file, "MZ").unwrap();
-
-    let exts = [".exe", ".cmd", ".bat", ".ps1"];
-    let dirs = std::slice::from_ref(&dir);
-    assert_eq!(resolve_windows_executable("opencode", dirs, &exts), Some(ResolvedExec::CmdBatch(cmd_file)));
-    assert_eq!(resolve_windows_executable("claude", dirs, &exts), Some(ResolvedExec::PowerShell(ps1_file)));
-    assert_eq!(resolve_windows_executable("aider", dirs, &exts), Some(ResolvedExec::Direct(exe_file)));
-    let _ = std::fs::remove_dir_all(&dir);
 }

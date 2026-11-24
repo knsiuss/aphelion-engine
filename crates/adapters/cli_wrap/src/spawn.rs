@@ -116,3 +116,36 @@ fn inject_universal_env(cmd: &mut Command, proxy_base: &str) {
         .env("GOOGLE_GEMINI_BASE_URL", proxy_base)
         .env("OLLAMA_HOST", proxy_base);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_pathext_resolves_exe_cmd_and_ps1_priority() {
+        let dir = std::env::temp_dir().join("aphelion_pathext_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cmd_file = dir.join("opencode.cmd");
+        let ps1_file = dir.join("claude.ps1");
+        let exe_file = dir.join("aider.exe");
+        std::fs::write(&cmd_file, "@echo off").unwrap();
+        std::fs::write(&ps1_file, "Write-Host hi").unwrap();
+        std::fs::write(&exe_file, "MZ").unwrap();
+
+        let exts = [".exe", ".cmd", ".bat", ".ps1"];
+        let dirs = std::slice::from_ref(&dir);
+        assert_eq!(
+            resolve_windows_executable("opencode", dirs, &exts),
+            Some(ResolvedExec::CmdBatch(cmd_file))
+        );
+        assert_eq!(
+            resolve_windows_executable("claude", dirs, &exts),
+            Some(ResolvedExec::PowerShell(ps1_file))
+        );
+        assert_eq!(
+            resolve_windows_executable("aider", dirs, &exts),
+            Some(ResolvedExec::Direct(exe_file))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

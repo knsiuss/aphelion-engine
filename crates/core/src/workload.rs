@@ -120,7 +120,10 @@ fn has_agentic_tool_history(root: &Value) -> bool {
     };
     msgs.iter().any(|m| {
         m.get("role").and_then(Value::as_str) == Some("tool")
-            || m.get("tool_calls").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false)
+            || m.get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
             || m.get("content")
                 .and_then(Value::as_array)
                 .map(|arr| {

@@ -12,7 +12,11 @@ pub fn analyze_and_anchor(ir: &mut NormalizedRequest, state: &mut SessionState) 
     let Some(last) = messages.last_mut() else {
         return;
     };
-    let Some(content) = last.get("content").and_then(Value::as_str).map(str::to_owned) else {
+    let Some(content) = last
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return;
     };
 

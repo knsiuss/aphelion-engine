@@ -3,48 +3,64 @@ use aphelion_core::validator::validate_outbound_messages;
 use serde_json::{json, Value};
 
 #[test]
-fn openai_diet_gc_pins_actively_referenced_file_and_keeps_valid_graph() {
+fn openai_ingress_dedup_preserves_initial_read_and_valid_graph() {
     let mut state = SessionState::default();
-    let big_old = "pub fn legacy() { let x = 1; }\n".repeat(450);
-    let active_src = "pub fn active_target() -> usize { 42 }\n".repeat(350);
+    let big_file = format!(
+        "File: src/old_file.rs\n{}",
+        "pub fn legacy() { let x = 1; }\n".repeat(45)
+    );
 
-    // Turn 0
     let t0 = serde_json::to_vec(&json!({
         "model": "gpt-4o",
         "system": "Rust assistant cwd: /repo/app",
-        "messages": [{"role": "user", "content": "Inspect files"}]
+        "messages": [
+            {"role": "user", "content": "Inspect files"},
+            {"role": "assistant", "content": "Reading", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/old_file.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": big_file}
+        ]
     }))
     .unwrap();
-    aphelion_core::prepare_request(&t0, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out0 =
+        aphelion_core::prepare_request(&t0, ExecutionProfile::Ephemeral, &mut state).unwrap();
 
-    // Turn 1: old_file.rs read (stale) + active.rs read (referenced in final user turn)
+    // Turn 1: re-reads identical src/old_file.rs at ingress -> deduplicated BEFORE freeze,
+    // while frozen Turn-0 history remains 100% immutable and graph stays valid.
     let t1 = serde_json::to_vec(&json!({
         "model": "gpt-4o",
         "system": "Rust assistant cwd: /repo/app",
         "messages": [
             {"role": "user", "content": "Inspect files"},
-            {"role": "assistant", "content": "Reading old", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/old_file.rs\"}"}}]},
-            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": format!("File: src/old_file.rs\n{big_old}")},
-            {"role": "assistant", "content": "Reading active", "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"src/active.rs\"}"}}]},
-            {"role": "tool", "tool_call_id": "c2", "name": "read_file", "content": format!("File: src/active.rs\n{active_src}")},
-            {"role": "user", "content": "Now update src/active.rs to return 99."}
+            {"role": "assistant", "content": "Reading", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"src/old_file.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": big_file},
+            {"role": "assistant", "content": "Reading again", "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\":\"src/old_file.rs\"}"}}]},
+            {"role": "tool", "tool_call_id": "c2", "name": "read_file", "content": big_file}
         ]
     }))
     .unwrap();
 
-    let out = aphelion_core::prepare_request(&t1, ExecutionProfile::Ephemeral, &mut state).unwrap();
-    let parsed: Value = serde_json::from_slice(&out.body).unwrap();
+    let out1 =
+        aphelion_core::prepare_request(&t1, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let parsed: Value = serde_json::from_slice(&out1.body).unwrap();
     assert!(validate_outbound_messages(Dialect::OpenAiChat, &parsed).is_ok());
-    assert!(!out.metrics.stage_stats.validator_rollback);
+    assert!(!out1.metrics.stage_stats.validator_rollback);
+    assert_eq!(
+        &out1.body[..out0.body.len() - 2],
+        &out0.body[..out0.body.len() - 2]
+    );
 
     let msgs = parsed["messages"].as_array().unwrap();
-    // Stale old_file.rs was compacted, while actively referenced src/active.rs was pinned!
-    assert!(msgs[2]["content"].as_str().unwrap().starts_with("[AgentDiet Tombstone:"));
-    assert!(msgs[4]["content"].as_str().unwrap().contains("pub fn active_target()"));
+    assert!(msgs[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("pub fn legacy()"));
+    assert!(msgs[4]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("[Aphelion Ingress Dedup:"));
 }
 
 #[test]
-fn anthropic_atomic_pair_collapse_preserves_role_alternation_and_tool_ids() {
+fn anthropic_circuit_breaker_preserves_history_and_tool_ids() {
     let mut state = SessionState::default();
     let make_req = |retry_count: usize| {
         let mut msgs = vec![json!({"role": "user", "content": "Fix schema.sql"})];
@@ -69,17 +85,25 @@ fn anthropic_atomic_pair_collapse_preserves_role_alternation_and_tool_ids() {
         .unwrap()
     };
 
-    let out1 = aphelion_core::prepare_request(&make_req(1), ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out1 =
+        aphelion_core::prepare_request(&make_req(1), ExecutionProfile::Ephemeral, &mut state)
+            .unwrap();
     let p1: Value = serde_json::from_slice(&out1.body).unwrap();
     assert!(validate_outbound_messages(Dialect::AnthropicMessages, &p1).is_ok());
 
-    let out2 = aphelion_core::prepare_request(&make_req(2), ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out2 =
+        aphelion_core::prepare_request(&make_req(2), ExecutionProfile::Ephemeral, &mut state)
+            .unwrap();
     let p2: Value = serde_json::from_slice(&out2.body).unwrap();
     assert!(out2.metrics.stage_stats.circuit_breaker_tripped);
     assert!(!out2.metrics.stage_stats.validator_rollback);
     assert!(validate_outbound_messages(Dialect::AnthropicMessages, &p2).is_ok());
-    // Atomic pair collapse removed (tu_1 assistant + tu_1 user), leaving user + tu_2 pair = 3 msgs
-    assert_eq!(p2["messages"].as_array().unwrap().len(), 3);
+    // Append-Only Prefix Invariance: all 5 messages remain intact and frozen prefix matches out1.
+    assert_eq!(p2["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        &out2.body[..out1.body.len() - 2],
+        &out1.body[..out1.body.len() - 2]
+    );
 }
 
 #[test]

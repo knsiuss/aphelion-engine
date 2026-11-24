@@ -90,7 +90,12 @@ async fn handle_request(
 
     let raw_bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "failed reading body")),
+        Err(_) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "failed reading body",
+            ))
+        }
     };
     let decoded_body = decode_incoming_body(&headers, &raw_bytes);
     let target_url = resolve_upstream_url(&state.targets, &headers, &path_and_query);
@@ -137,7 +142,10 @@ async fn handle_request(
 
     if !status.is_success() {
         let err_bytes = upstream_res.bytes().await.unwrap_or_default();
-        eprintln!("[aphelion] upstream HTTP {} on {path_and_query}", status.as_u16());
+        eprintln!(
+            "[aphelion] upstream HTTP {} on {path_and_query}",
+            status.as_u16()
+        );
         let resp = Response::builder()
             .status(status)
             .header("content-type", content_type)
@@ -147,7 +155,13 @@ async fn handle_request(
     }
 
     if content_type.contains("text/event-stream") || content_type.contains("application/x-ndjson") {
-        return Ok(stream_sse_response(status, content_type, upstream_res, state, pending));
+        return Ok(stream_sse_response(
+            status,
+            content_type,
+            upstream_res,
+            state,
+            pending,
+        ));
     }
 
     let mut bytes = upstream_res.bytes().await.unwrap_or_default().to_vec();

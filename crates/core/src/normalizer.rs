@@ -10,7 +10,10 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 /// Parses raw request bytes into a normalized IR across all major LLM dialects.
 /// Unrecognized JSON schemas or non-JSON bodies degrade safely to `Dialect::Passthrough`
 /// (byte-for-byte untouched) with zero errors.
-pub fn normalize(raw_json: &[u8], state: &mut SessionState) -> Result<NormalizedRequest, CoreError> {
+pub fn normalize(
+    raw_json: &[u8],
+    state: &mut SessionState,
+) -> Result<NormalizedRequest, CoreError> {
     let Ok(root) = serde_json::from_slice::<Value>(raw_json) else {
         return Ok(passthrough_ir(raw_json));
     };
@@ -26,18 +29,25 @@ pub fn normalize(raw_json: &[u8], state: &mut SessionState) -> Result<Normalized
 
     let active_tool_loop = detect_active_tool_loop(&root, dialect);
     let workload = classify_workload(dialect, &root, active_tool_loop);
-    let model = root.get("model").and_then(Value::as_str).unwrap_or_default();
-    let supports_prefill = model_supports_prefill(model);
-    let supports_vision = model_supports_vision(model);
+    let model = root
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    state.active_model = model.clone();
+    let supports_prefill = model_supports_prefill(&model);
+    let supports_vision = model_supports_vision(&model);
     let pre_compaction_messages = root.get("messages").cloned();
 
     Ok(NormalizedRequest {
         dialect,
         workload,
+        model_id: model,
         root,
         raw_passthrough: None,
         sacred_boundary,
         is_turn_zero,
+        ingress_start: 0,
         active_tool_loop,
         complexity: Complexity::Trivial,
         supports_prefill,
@@ -54,10 +64,12 @@ fn passthrough_ir(raw: &[u8]) -> NormalizedRequest {
     NormalizedRequest {
         dialect: Dialect::Passthrough,
         workload: WorkloadClass::Passthrough,
+        model_id: String::new(),
         root: Value::Null,
         raw_passthrough: Some(raw.to_vec()),
         sacred_boundary: 0,
         is_turn_zero: false,
+        ingress_start: 0,
         active_tool_loop: false,
         complexity: Complexity::Trivial,
         supports_prefill: false,
@@ -131,7 +143,13 @@ fn derive_two_phase_session(root: &Value, dialect: Dialect, state: &mut SessionS
 
 pub fn extract_workspace_fingerprint(system: &str, first_user: &str) -> String {
     for source in [system, first_user] {
-        for marker in ["cwd:", "CWD:", "workspace:", "repo_root:", "Working directory:"] {
+        for marker in [
+            "cwd:",
+            "CWD:",
+            "workspace:",
+            "repo_root:",
+            "Working directory:",
+        ] {
             if let Some(idx) = source.find(marker) {
                 let rest = &source[idx + marker.len()..];
                 let line = rest
@@ -160,7 +178,11 @@ fn detect_active_tool_loop(root: &Value, dialect: Dialect) -> bool {
     if dialect == Dialect::OpenAiResponses {
         return true;
     }
-    let Some(last) = root.get("messages").and_then(Value::as_array).and_then(|m| m.last()) else {
+    let Some(last) = root
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| m.last())
+    else {
         return has_tools;
     };
     let role = last.get("role").and_then(Value::as_str).unwrap_or_default();

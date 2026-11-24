@@ -24,11 +24,15 @@ pub fn rasterize_if_eligible(ir: &mut NormalizedRequest, state: &SessionState) {
         return;
     }
 
-    let last_idx = messages.len() - 1;
+    let start_idx = ir.ingress_start.min(messages.len());
+    if start_idx >= messages.len() {
+        return;
+    }
     let mut eligible_indices = Vec::new();
     let mut total_tokens = 0usize;
 
-    for (idx, msg) in messages[..last_idx].iter().enumerate() {
+    for (rel_idx, msg) in messages[start_idx..].iter().enumerate() {
+        let idx = start_idx + rel_idx;
         if msg.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
         }

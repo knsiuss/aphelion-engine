@@ -74,7 +74,6 @@ fn check_error_loop(text: &str, ir: &mut NormalizedRequest, state: &mut SessionS
 
     if repeated {
         trip_circuit_breaker(ir, "identical error signature repeated >=2x");
-        collapse_duplicate_retry_turn(ir, state);
     }
     true
 }
@@ -82,55 +81,11 @@ fn check_error_loop(text: &str, ir: &mut NormalizedRequest, state: &mut SessionS
 fn trip_circuit_breaker(ir: &mut NormalizedRequest, reason: &str) {
     ir.complexity = Complexity::Deep;
     ir.stage_stats.circuit_breaker_tripped = true;
+    // Append-Only Prefix Invariance: NEVER drain or mutate historical messages[0..ingress_start].
+    // Inject the strategy-pivot directive purely into the newly arriving tail message.
     ir.tail_directives.push(format!(
         "[Circuit Breaker: {reason}. Stop retrying the same edit; inspect definitions and pivot strategy.]"
     ));
-}
-
-/// Atomically removes the previous duplicate `(assistant tool_call/tool_use + corresponding
-/// tool/tool_result)` pair so strict OpenAI & Anthropic message-graph contracts remain 100% legal.
-fn collapse_duplicate_retry_turn(ir: &mut NormalizedRequest, state: &SessionState) {
-    if state.sacred_cache_boundary > 0 {
-        return;
-    }
-    let Some(messages) = ir.root.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    if messages.len() < 5 {
-        return;
-    }
-
-    // Current turn is typically `[..., prev_asst, prev_tool_or_user, curr_asst, curr_tool_or_user]`.
-    let prev_res_idx = messages.len() - 3;
-    let prev_asst_idx = messages.len() - 4;
-
-    let prev_asst_role = messages[prev_asst_idx].get("role").and_then(Value::as_str);
-    let prev_res_role = messages[prev_res_idx].get("role").and_then(Value::as_str);
-
-    let is_openai_pair = prev_asst_role == Some("assistant")
-        && messages[prev_asst_idx]
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(|a| a.len() == 1)
-            .unwrap_or(false)
-        && prev_res_role == Some("tool");
-
-    let is_anthropic_pair = prev_asst_role == Some("assistant")
-        && prev_res_role == Some("user")
-        && messages[prev_asst_idx]
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")))
-            .unwrap_or(false)
-        && messages[prev_res_idx]
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
-            .unwrap_or(false);
-
-    if is_openai_pair || is_anthropic_pair {
-        messages.drain(prev_asst_idx..=prev_res_idx);
-    }
 }
 
 fn evaluate_compiled_slm_route(
@@ -167,7 +122,11 @@ fn extract_last_message_text(root: &Value) -> Option<String> {
     let blocks = last.get("content")?.as_array()?;
     let joined: Vec<&str> = blocks
         .iter()
-        .filter_map(|b| b.get("content").or_else(|| b.get("text")).and_then(Value::as_str))
+        .filter_map(|b| {
+            b.get("content")
+                .or_else(|| b.get("text"))
+                .and_then(Value::as_str)
+        })
         .collect();
     if joined.is_empty() {
         None

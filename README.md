@@ -2,7 +2,12 @@
 
 **Universal Sans-I/O Layer-3 AI Inference & Token Optimizer for Every Coding Agent, Router, SDK, and Non-Agentic Workload.**
 
-`aphelion` transparently optimizes OpenAI Chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), Google Gemini (`*:generateContent`), and Ollama (`/api/chat`, `/api/generate`) traffic—automatically routing **agentic loops**, **direct code edits**, **single-turn RAG/chat**, **structured JSON outputs**, and **transparent passthrough** (`/v1/models`, `/v1/embeddings`, `X-Aphelion-Bypass: true`) without ever injecting agentic directives into non-agentic requests.
+`aphelion` transparently optimizes OpenAI Chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), Google Gemini (`*:generateContent`), and Ollama (`/api/chat`, `/api/generate`) traffic using **Strict KV-Cache Preservation (Append-Only Prefix Invariance)**:
+
+- **`PrefixLedger` & Append-Only History Lock:** Freezes Turn-0 `system` + deterministically sorted `tools[]` and replays historical messages `0..k` byte-for-byte identically on every subsequent turn ($S_{\text{prefix}} = 1.00$), preventing mid-history cache-busting regressions.
+- **Pre-Commit Ingress Optimization ("Optimize Once, Freeze Forever"):** Deduplicates identical repeated `read_file` calls (by `XXH3_64` hash), applies `TRON` tabular compression, and collapses repetitive log lines on newly appended messages `messages[k..n]` **before** first dispatch.
+- **Cache-Aware Telemetry & Cache-Drop Circuit Breaker:** Tracks real upstream `uncached_input_tokens` vs. `cached_read_tokens` (`prompt_tokens_details.cached_tokens`, `cache_read_input_tokens`, `prompt_cache_hit_tokens`) and automatically locks into `FrozenPrefixPass` if rolling `cache_hit_ratio < 0.70` on turns `>= 3`.
+- **Automatic Workload Routing:** Separates **agentic loops**, **direct code edits**, **single-turn RAG/chat**, **structured JSON outputs**, and **transparent passthrough** (`/v1/models`, `/v1/embeddings`, `X-Aphelion-Bypass: true`) without ever injecting agentic directives into non-agentic requests.
 
 ---
 

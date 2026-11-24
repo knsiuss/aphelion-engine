@@ -40,9 +40,10 @@ impl TurnTelemetry {
     /// Effective Cost `C_eff` in USD accounting for 1.25x cache write, 0.1x cache read,
     /// `<think>` output tokens, action output tokens, and local compiled SLM tokens.
     pub fn effective_cost_usd(&self, rates: PricingRates) -> f64 {
-        let uncached = self
-            .opt_input_tokens
-            .saturating_sub(self.cache_write_tokens.saturating_add(self.cache_read_tokens));
+        let uncached = self.opt_input_tokens.saturating_sub(
+            self.cache_write_tokens
+                .saturating_add(self.cache_read_tokens),
+        );
         let in_cost = ((uncached as f64)
             + (self.cache_write_tokens as f64) * rates.cache_write_mult
             + (self.cache_read_tokens as f64) * rates.cache_read_mult)

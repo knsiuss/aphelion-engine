@@ -14,8 +14,7 @@ pub fn apply_block_patch(span: &BlockSpan, patched_block: &str) -> Option<String
     {
         return None;
     }
-    let mut reconstructed =
-        String::with_capacity(span.original_source.len() + patched_block.len());
+    let mut reconstructed = String::with_capacity(span.original_source.len() + patched_block.len());
     reconstructed.push_str(&span.original_source[..span.byte_start]);
     reconstructed.push_str(patched_block);
     reconstructed.push_str(&span.original_source[span.byte_end..]);

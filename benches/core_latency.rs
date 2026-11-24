@@ -18,19 +18,27 @@ fn build_payload(target_bytes: usize) -> Vec<u8> {
 
 fn bench_core_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("aphelion_core_ephemeral");
-    for &(label, size) in &[("10KB", 10_240usize), ("50KB", 51_200usize), ("200KB", 204_800usize)] {
+    for &(label, size) in &[
+        ("10KB", 10_240usize),
+        ("50KB", 51_200usize),
+        ("200KB", 204_800usize),
+    ] {
         let payload = build_payload(size);
-        group.bench_with_input(BenchmarkId::new("prepare_request", label), &payload, |b, data| {
-            b.iter(|| {
-                let mut state = SessionState::default();
-                let res = aphelion_core::prepare_request(
-                    black_box(data),
-                    ExecutionProfile::Ephemeral,
-                    &mut state,
-                );
-                black_box(res.ok())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("prepare_request", label),
+            &payload,
+            |b, data| {
+                b.iter(|| {
+                    let mut state = SessionState::default();
+                    let res = aphelion_core::prepare_request(
+                        black_box(data),
+                        ExecutionProfile::Ephemeral,
+                        &mut state,
+                    );
+                    black_box(res.ok())
+                });
+            },
+        );
     }
     group.finish();
 }

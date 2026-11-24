@@ -6,7 +6,9 @@ use std::collections::HashSet;
 /// Verifies outbound message-graph legality so Aphelion never causes a proxy-induced HTTP 400.
 pub fn validate_outbound_messages(dialect: Dialect, root: &Value) -> Result<(), CoreError> {
     let Some(messages) = root.get("messages").and_then(Value::as_array) else {
-        return Err(CoreError::InvalidMessageGraph("missing messages array".to_owned()));
+        return Err(CoreError::InvalidMessageGraph(
+            "missing messages array".to_owned(),
+        ));
     };
     match dialect {
         Dialect::OpenAiChat => validate_openai(messages),
@@ -91,7 +93,8 @@ fn validate_anthropic(messages: &[Value]) -> Result<(), CoreError> {
         if !pending_use_ids.is_empty() {
             if role != "user" {
                 return Err(CoreError::InvalidMessageGraph(
-                    "Anthropic tool_use must be immediately followed by user tool_result".to_owned(),
+                    "Anthropic tool_use must be immediately followed by user tool_result"
+                        .to_owned(),
                 ));
             }
             let result_ids = extract_anthropic_tool_result_ids(msg);

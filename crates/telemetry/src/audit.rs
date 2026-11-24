@@ -1,3 +1,6 @@
+pub use crate::prefix_store::AuditSummary;
+use crate::prefix_store::{init_prefix_schema, load_record, save_record};
+use aphelion_core::prefix_ledger::{FrozenSessionRecord, LedgerKey};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -18,6 +21,7 @@ pub struct AuditRecord {
     pub model: String,
     pub raw_tokens: usize,
     pub opt_tokens: usize,
+    pub uncached_input_tokens: usize,
     pub cache_read_tokens: usize,
     pub cache_creation_tokens: usize,
     pub output_tokens: usize,
@@ -27,40 +31,11 @@ pub struct AuditRecord {
     pub c_eff_usd: f64,
     pub slm_routed: bool,
     pub circuit_breaker_tripped: bool,
+    pub cache_drop_breaker_tripped: bool,
     pub prompt_text: String,
     pub response_text: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AuditSummary {
-    pub total_requests: usize,
-    pub total_raw_tokens: usize,
-    pub total_opt_tokens: usize,
-    pub total_cache_read_tokens: usize,
-    pub total_circuit_breaker_trips: usize,
-    pub total_c_eff_usd: f64,
-    pub estimated_baseline_usd: f64,
-}
-
-impl AuditSummary {
-    pub fn cache_hit_pct(&self) -> f64 {
-        if self.total_opt_tokens == 0 {
-            return 0.0;
-        }
-        (self.total_cache_read_tokens as f64 * 100.0) / (self.total_opt_tokens as f64)
-    }
-
-    pub fn bpe_tokens_saved(&self) -> usize {
-        self.total_raw_tokens.saturating_sub(self.total_opt_tokens)
-    }
-
-    pub fn net_usd_saved(&self) -> f64 {
-        (self.estimated_baseline_usd - self.total_c_eff_usd).max(0.0)
-    }
-}
-
-/// SQLite Flight Recorder storing turn-by-turn proxy metrics, verified upstream usage,
-/// and sanitized trajectories for `--audit-summary`, `--audit-export`, and distillation.
 pub struct AuditLedger {
     conn: Connection,
 }
@@ -87,6 +62,7 @@ impl AuditLedger {
                 model TEXT NOT NULL,
                 raw_tokens INTEGER NOT NULL,
                 opt_tokens INTEGER NOT NULL,
+                uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -96,39 +72,47 @@ impl AuditLedger {
                 c_eff_usd REAL NOT NULL,
                 slm_routed INTEGER NOT NULL,
                 circuit_breaker_tripped INTEGER NOT NULL DEFAULT 0,
+                cache_drop_breaker_tripped INTEGER NOT NULL DEFAULT 0,
                 prompt_text TEXT NOT NULL,
                 response_text TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );",
         )?;
+        let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN uncached_input_tokens INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN cache_drop_breaker_tripped INTEGER NOT NULL DEFAULT 0", []);
+        init_prefix_schema(conn)?;
         Ok(())
+    }
+
+    pub fn save_prefix_record(
+        &self,
+        key: &LedgerKey,
+        rec: &FrozenSessionRecord,
+    ) -> Result<(), AuditError> {
+        save_record(&self.conn, key, rec)?;
+        Ok(())
+    }
+
+    pub fn load_prefix_record(&self, key: &LedgerKey) -> Option<FrozenSessionRecord> {
+        load_record(&self.conn, key)
     }
 
     pub fn record(&self, rec: &AuditRecord) -> Result<(), AuditError> {
         self.conn.execute(
             "INSERT INTO flight_recorder (
                 session_id, turn_index, model, raw_tokens, opt_tokens,
-                cache_read_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
-                ttft_ms, total_ms, c_eff_usd, slm_routed, circuit_breaker_tripped,
+                uncached_input_tokens, cache_read_tokens, cache_creation_tokens,
+                output_tokens, reasoning_tokens, ttft_ms, total_ms, c_eff_usd,
+                slm_routed, circuit_breaker_tripped, cache_drop_breaker_tripped,
                 prompt_text, response_text
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
-                rec.session_id,
-                rec.turn_index as i64,
-                rec.model,
-                rec.raw_tokens as i64,
-                rec.opt_tokens as i64,
-                rec.cache_read_tokens as i64,
-                rec.cache_creation_tokens as i64,
-                rec.output_tokens as i64,
-                rec.reasoning_tokens as i64,
-                rec.ttft_ms as i64,
-                rec.total_ms as i64,
-                rec.c_eff_usd,
-                i64::from(rec.slm_routed),
-                i64::from(rec.circuit_breaker_tripped),
-                rec.prompt_text,
-                rec.response_text,
+                rec.session_id, rec.turn_index as i64, rec.model, rec.raw_tokens as i64,
+                rec.opt_tokens as i64, rec.uncached_input_tokens as i64, rec.cache_read_tokens as i64,
+                rec.cache_creation_tokens as i64, rec.output_tokens as i64, rec.reasoning_tokens as i64,
+                rec.ttft_ms as i64, rec.total_ms as i64, rec.c_eff_usd,
+                i64::from(rec.slm_routed), i64::from(rec.circuit_breaker_tripped),
+                i64::from(rec.cache_drop_breaker_tripped), rec.prompt_text, rec.response_text,
             ],
         )?;
         Ok(())
@@ -137,8 +121,9 @@ impl AuditLedger {
     pub fn load_all(&self) -> Result<Vec<AuditRecord>, AuditError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, turn_index, model, raw_tokens, opt_tokens,
-                    cache_read_tokens, cache_creation_tokens, output_tokens, reasoning_tokens,
-                    ttft_ms, total_ms, c_eff_usd, slm_routed, circuit_breaker_tripped,
+                    uncached_input_tokens, cache_read_tokens, cache_creation_tokens,
+                    output_tokens, reasoning_tokens, ttft_ms, total_ms, c_eff_usd,
+                    slm_routed, circuit_breaker_tripped, cache_drop_breaker_tripped,
                     prompt_text, response_text
              FROM flight_recorder ORDER BY id ASC",
         )?;
@@ -149,17 +134,19 @@ impl AuditLedger {
                 model: row.get(2)?,
                 raw_tokens: row.get::<_, i64>(3)? as usize,
                 opt_tokens: row.get::<_, i64>(4)? as usize,
-                cache_read_tokens: row.get::<_, i64>(5)? as usize,
-                cache_creation_tokens: row.get::<_, i64>(6)? as usize,
-                output_tokens: row.get::<_, i64>(7)? as usize,
-                reasoning_tokens: row.get::<_, i64>(8)? as usize,
-                ttft_ms: row.get::<_, i64>(9)? as u64,
-                total_ms: row.get::<_, i64>(10)? as u64,
-                c_eff_usd: row.get(11)?,
-                slm_routed: row.get::<_, i64>(12)? != 0,
-                circuit_breaker_tripped: row.get::<_, i64>(13)? != 0,
-                prompt_text: row.get(14)?,
-                response_text: row.get(15)?,
+                uncached_input_tokens: row.get::<_, i64>(5)? as usize,
+                cache_read_tokens: row.get::<_, i64>(6)? as usize,
+                cache_creation_tokens: row.get::<_, i64>(7)? as usize,
+                output_tokens: row.get::<_, i64>(8)? as usize,
+                reasoning_tokens: row.get::<_, i64>(9)? as usize,
+                ttft_ms: row.get::<_, i64>(10)? as u64,
+                total_ms: row.get::<_, i64>(11)? as u64,
+                c_eff_usd: row.get(12)?,
+                slm_routed: row.get::<_, i64>(13)? != 0,
+                circuit_breaker_tripped: row.get::<_, i64>(14)? != 0,
+                cache_drop_breaker_tripped: row.get::<_, i64>(15)? != 0,
+                prompt_text: row.get(16)?,
+                response_text: row.get(17)?,
             })
         })?;
         let mut out = Vec::new();
@@ -172,22 +159,55 @@ impl AuditLedger {
     pub fn summarize(&self) -> Result<AuditSummary, AuditError> {
         let records = self.load_all()?;
         let mut sum = AuditSummary::default();
+        let uncached_rate = 3.0 / 1_000_000.0;
+        let cache_read_rate = 0.10 * uncached_rate;
+        let cache_write_rate = 1.25 * uncached_rate;
+        let output_rate = 15.0 / 1_000_000.0;
+
         for r in records {
             sum.total_requests += 1;
             sum.total_raw_tokens += r.raw_tokens;
             sum.total_opt_tokens += r.opt_tokens;
+            sum.total_uncached_input_tokens += r.uncached_input_tokens;
             sum.total_cache_read_tokens += r.cache_read_tokens;
+            sum.total_cache_creation_tokens += r.cache_creation_tokens;
+            sum.total_output_tokens += r.output_tokens;
             if r.circuit_breaker_tripped {
                 sum.total_circuit_breaker_trips += 1;
             }
-            sum.total_c_eff_usd += r.c_eff_usd;
-            sum.estimated_baseline_usd +=
-                (r.raw_tokens as f64) * 3.0 / 1_000_000.0 + (r.output_tokens as f64) * 15.0 / 1_000_000.0;
+            if r.cache_drop_breaker_tripped {
+                sum.total_cache_drop_breaker_trips += 1;
+            }
+
+            let actual_uncached = if r.uncached_input_tokens > 0 || r.cache_read_tokens > 0 {
+                r.uncached_input_tokens
+            } else {
+                r.opt_tokens
+            };
+            let actual_turn_cost = (actual_uncached as f64) * uncached_rate
+                + (r.cache_read_tokens as f64) * cache_read_rate
+                + (r.cache_creation_tokens as f64) * cache_write_rate
+                + (r.output_tokens as f64) * output_rate;
+            sum.total_c_eff_usd += if r.c_eff_usd > 0.0 && r.uncached_input_tokens == 0 {
+                r.c_eff_usd
+            } else {
+                actual_turn_cost
+            };
+
+            // Asymmetric cached baseline: turns > 1 assume normal 90% upstream prefix cache hit.
+            let (base_cached, base_uncached) = if r.turn_index > 1 {
+                let c = ((r.raw_tokens as f64) * 0.90) as usize;
+                (c, r.raw_tokens.saturating_sub(c))
+            } else {
+                (0, r.raw_tokens)
+            };
+            sum.asymmetric_baseline_usd += (base_uncached as f64) * uncached_rate
+                + (base_cached as f64) * cache_read_rate
+                + (r.output_tokens as f64) * output_rate;
         }
         Ok(sum)
     }
 
-    /// Exports sanitized JSON request payloads as `.jsonl` ready for `aphelion-bench-harness`.
     pub fn export_jsonl<W: Write>(&self, writer: &mut W) -> Result<usize, AuditError> {
         let records = self.load_all()?;
         let mut count = 0usize;

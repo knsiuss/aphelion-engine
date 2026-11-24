@@ -57,8 +57,8 @@ async fn main() {
     }
 
     if args.iter().any(|a| a == "--live-ab") {
-        let upstream = arg_val(&args, "--upstream")
-            .unwrap_or("http://127.0.0.1:8000/v1/chat/completions");
+        let upstream =
+            arg_val(&args, "--upstream").unwrap_or("http://127.0.0.1:8000/v1/chat/completions");
         let api_key_env = arg_val(&args, "--api-key-env").unwrap_or("OPENAI_API_KEY");
         let model = arg_val(&args, "--model");
         let traj = match arg_val(&args, "--input") {
@@ -83,7 +83,10 @@ async fn main() {
         ("mcp_tool_heavy.jsonl", fixtures::mcp_tool_heavy()),
         ("rag_long_context.jsonl", fixtures::rag_long_context()),
     ] {
-        let traj: Vec<Vec<u8>> = items.iter().filter_map(|v| serde_json::to_vec(v).ok()).collect();
+        let traj: Vec<Vec<u8>> = items
+            .iter()
+            .filter_map(|v| serde_json::to_vec(v).ok())
+            .collect();
         print_table(name, &run_ablation(&traj));
     }
 }

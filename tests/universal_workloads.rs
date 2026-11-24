@@ -16,7 +16,8 @@ fn single_turn_rag_compresses_prose_masks_code_and_injects_zero_agentic_directiv
     }))
     .unwrap();
 
-    let out = aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out =
+        aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     assert_eq!(out.metrics.dialect, Dialect::OpenAiChat);
     assert_eq!(out.metrics.workload, WorkloadClass::SingleTurnRagOrChat);
     assert!(!out.metrics.prefill_injected);
@@ -38,7 +39,8 @@ fn structured_output_openai_and_gemini_disable_prefill_and_tail_directives() {
         "messages": [{"role": "user", "content": "Please basically extract the user name from this text."}]
     }))
     .unwrap();
-    let o1 = aphelion_core::prepare_request(&openai_json, ExecutionProfile::Ephemeral, &mut s1).unwrap();
+    let o1 =
+        aphelion_core::prepare_request(&openai_json, ExecutionProfile::Ephemeral, &mut s1).unwrap();
     assert_eq!(o1.metrics.workload, WorkloadClass::StructuredOutput);
     assert!(!o1.metrics.prefill_injected);
     let p1: Value = serde_json::from_slice(&o1.body).unwrap();
@@ -51,7 +53,8 @@ fn structured_output_openai_and_gemini_disable_prefill_and_tail_directives() {
         "contents": [{"role": "user", "parts": [{"text": "Please kindly extract the fields from this record."}]}]
     }))
     .unwrap();
-    let o2 = aphelion_core::prepare_request(&gemini_json, ExecutionProfile::Ephemeral, &mut s2).unwrap();
+    let o2 =
+        aphelion_core::prepare_request(&gemini_json, ExecutionProfile::Ephemeral, &mut s2).unwrap();
     assert_eq!(o2.metrics.dialect, Dialect::GeminiGenerate);
     assert_eq!(o2.metrics.workload, WorkloadClass::StructuredOutput);
     assert!(!o2.metrics.prefill_injected);
@@ -76,11 +79,15 @@ fn openai_responses_api_tron_and_prefix_freeze() {
         ]
     }))
     .unwrap();
-    let out = aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out =
+        aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     assert_eq!(out.metrics.dialect, Dialect::OpenAiResponses);
     let parsed: Value = serde_json::from_slice(&out.body).unwrap();
     assert_eq!(parsed["previous_response_id"], "resp_123");
-    assert!(parsed["input"][0]["output"].as_str().unwrap().starts_with("@tron["));
+    assert!(parsed["input"][0]["output"]
+        .as_str()
+        .unwrap()
+        .starts_with("@tron["));
 }
 
 #[test]
@@ -97,9 +104,13 @@ fn anthropic_array_system_and_thinking_signature_preserved() {
         ]
     }))
     .unwrap();
-    let out = aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
+    let out =
+        aphelion_core::prepare_request(&req, ExecutionProfile::Ephemeral, &mut state).unwrap();
     let parsed: Value = serde_json::from_slice(&out.body).unwrap();
-    assert_eq!(parsed["messages"][1]["content"][0]["signature"], "sig_xyz_999");
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["signature"],
+        "sig_xyz_999"
+    );
 }
 
 #[test]

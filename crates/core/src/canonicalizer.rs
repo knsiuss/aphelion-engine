@@ -1,3 +1,4 @@
+use crate::prefix_ledger::{replay_frozen_history, PrefixLedger};
 use crate::types::{NormalizedRequest, SessionState};
 use crate::CoreError;
 use serde_json::{Map, Value};
@@ -11,14 +12,15 @@ const PREFIX_KEYS: &[&str] = &[
     "tools",
 ];
 
-/// Canonicalizes JSON keys on Turn-0 with static prefix keys (`anthropic_version`, `model`,
-/// `system`, `tools`) serialized FIRST so `out[..frozen_prefix_len]` is byte-for-byte
-/// identical across all subsequent turns (Hard Invariant 1: Zero Prefix Mutation).
+/// Canonicalizes JSON keys on Turn-0 with static prefix keys FIRST and `"messages"` LAST,
+/// freezes Turn-0 prefix bytes, and replays strictly frozen historical messages `0..k`
+/// from `PrefixLedger` on Turn-N (Append-Only Prefix Invariance).
 pub fn apply_prefix_lock(
     ir: &mut NormalizedRequest,
     state: &mut SessionState,
 ) -> Result<(), CoreError> {
     state.sacred_cache_boundary = state.sacred_cache_boundary.max(ir.sacred_boundary);
+    let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
 
     // Explicit `cache_control` breakpoints are Sacred Read-Only Zones: zero reordering.
     if state.sacred_cache_boundary > 0 {
@@ -27,25 +29,44 @@ pub fn apply_prefix_lock(
             let bound = state.sacred_cache_boundary.min(wire.len());
             state.frozen_prefix_len = bound;
             state.frozen_prefix_bytes = wire[..bound].to_vec();
+            state
+                .prefix_ledger
+                .get_or_insert_mut(key)
+                .frozen_prefix_bytes = state.frozen_prefix_bytes.clone();
+        } else if let Some(record) = state.prefix_ledger.get(&key).cloned() {
+            if let Some(msgs) = ir.root.get_mut("messages").and_then(Value::as_array_mut) {
+                ir.ingress_start = replay_frozen_history(msgs, &record);
+            }
         }
         return Ok(());
     }
 
     if ir.is_turn_zero {
         extract_volatile_system_timestamp(ir);
+        sort_tools_deterministically(&mut ir.root);
         ir.root = canonicalize_root(&ir.root);
         let prefix_len = compute_wire_prefix_len(&ir.root);
         let wire = serde_json::to_vec(&ir.root)?;
         let bound = prefix_len.min(wire.len());
         state.frozen_prefix_len = bound;
         state.frozen_prefix_bytes = wire[..bound].to_vec();
-    } else if state.frozen_prefix_len > 0 {
-        // Restore Turn-0 static prefix keys before canonicalizing so prefix bytes never drift.
+        state
+            .prefix_ledger
+            .get_or_insert_mut(key)
+            .frozen_prefix_bytes = state.frozen_prefix_bytes.clone();
+    } else {
         ir.root = canonicalize_root(&ir.root);
         let wire = serde_json::to_vec(&ir.root)?;
-        if !verify_prefix_invariant(&state.frozen_prefix_bytes, &wire, state.frozen_prefix_len) {
+        if state.frozen_prefix_len > 0
+            && !verify_prefix_invariant(&state.frozen_prefix_bytes, &wire, state.frozen_prefix_len)
+        {
             restore_frozen_prefix_fields(&mut ir.root, &state.frozen_prefix_bytes);
             ir.root = canonicalize_root(&ir.root);
+        }
+        if let Some(record) = state.prefix_ledger.get(&key).cloned() {
+            if let Some(msgs) = ir.root.get_mut("messages").and_then(Value::as_array_mut) {
+                ir.ingress_start = replay_frozen_history(msgs, &record);
+            }
         }
     }
 
@@ -57,12 +78,11 @@ pub fn verify_prefix_invariant(prev: &[u8], curr: &[u8], frozen_len: usize) -> b
     if frozen_len == 0 {
         return true;
     }
-    prev.len() >= frozen_len
-        && curr.len() >= frozen_len
-        && prev[..frozen_len] == curr[..frozen_len]
+    prev.len() >= frozen_len && curr.len() >= frozen_len && prev[..frozen_len] == curr[..frozen_len]
 }
 
-/// Orders top-level static prefix keys first, then all remaining keys lexicographically.
+/// Orders top-level static prefix keys first, remaining non-`messages` keys lexicographically,
+/// and `"messages"` LAST so append-only history extensions share a 100% identical byte prefix.
 pub fn canonicalize_root(val: &Value) -> Value {
     let Value::Object(map) = val else {
         return sort_json_keys(val);
@@ -75,13 +95,16 @@ pub fn canonicalize_root(val: &Value) -> Value {
     }
     let mut rest: Vec<&String> = map
         .keys()
-        .filter(|k| !PREFIX_KEYS.contains(&k.as_str()))
+        .filter(|k| !PREFIX_KEYS.contains(&k.as_str()) && k.as_str() != "messages")
         .collect();
     rest.sort();
     for k in rest {
         if let Some(v) = map.get(k) {
             ordered.insert(k.clone(), sort_json_keys(v));
         }
+    }
+    if let Some(msgs) = map.get("messages") {
+        ordered.insert("messages".to_owned(), sort_json_keys(msgs));
     }
     Value::Object(ordered)
 }
@@ -104,6 +127,25 @@ pub fn sort_json_keys(val: &Value) -> Value {
     }
 }
 
+fn sort_tools_deterministically(root: &mut Value) {
+    let Some(tools) = root.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.sort_by(|a, b| {
+        let name_a = a
+            .pointer("/function/name")
+            .or_else(|| a.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name_b = b
+            .pointer("/function/name")
+            .or_else(|| b.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        name_a.cmp(name_b)
+    });
+}
+
 fn extract_volatile_system_timestamp(ir: &mut NormalizedRequest) {
     let Some(sys) = ir
         .root
@@ -124,7 +166,6 @@ fn extract_volatile_system_timestamp(ir: &mut NormalizedRequest) {
     }
 }
 
-/// Computes the exact wire byte length covering all leading static prefix keys.
 fn compute_wire_prefix_len(root: &Value) -> usize {
     let mut prefix_only = Map::new();
     for &pk in PREFIX_KEYS {
@@ -135,7 +176,6 @@ fn compute_wire_prefix_len(root: &Value) -> usize {
     if prefix_only.is_empty() {
         return 0;
     }
-    // Wire JSON of prefix_only is `{...}`; drop the closing `}` to get the exact shared prefix.
     serde_json::to_vec(&Value::Object(prefix_only))
         .map(|b| b.len().saturating_sub(1))
         .unwrap_or(0)

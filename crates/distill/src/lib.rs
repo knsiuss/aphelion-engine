@@ -120,7 +120,13 @@ fn compute_workflow_signature(prompt: &str) -> u64 {
     let normalized: String = prompt
         .chars()
         .take(256)
-        .map(|c| if c.is_ascii_digit() { '#' } else { c.to_ascii_lowercase() })
+        .map(|c| {
+            if c.is_ascii_digit() {
+                '#'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .collect();
     xxh3_64(normalized.as_bytes())
 }

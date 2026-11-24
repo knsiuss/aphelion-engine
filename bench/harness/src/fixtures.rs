@@ -32,7 +32,9 @@ pub fn coding_multi_turn() -> Vec<Value> {
         {"type": "function", "function": {"name": "run_tests", "description": "Run cargo test"}}
     ]);
     let big_file: String = (1..=210)
-        .map(|i| format!("pub fn compute_step_{i}(val: usize) -> usize {{ val.wrapping_add({i}) }}\n"))
+        .map(|i| {
+            format!("pub fn compute_step_{i}(val: usize) -> usize {{ val.wrapping_add({i}) }}\n")
+        })
         .collect();
     let old_log = "compiling crate module step check ok warning unused_var line 42\n".repeat(450);
 
@@ -104,7 +106,9 @@ pub fn mcp_tool_heavy() -> Vec<Value> {
     let tron_payload = serde_json::to_string(&rows).unwrap_or_default();
 
     let mut turns = Vec::new();
-    let mut history = vec![json!({"role": "user", "content": "Query workspace index via mcp_tool_01 and update schema."})];
+    let mut history = vec![
+        json!({"role": "user", "content": "Query workspace index via mcp_tool_01 and update schema."}),
+    ];
     turns.push(json!({"model": "gpt-4o", "system": "MCP Agent cwd: /repo/aphelion", "tools": tools, "messages": history}));
 
     history.push(json!({"role": "assistant", "content": "Querying.", "tool_calls": [{"id": "t1", "function": {"name": "mcp_tool_01", "arguments": "{\"q\":\"all\"}"}}]}));

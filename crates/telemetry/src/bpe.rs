@@ -16,12 +16,12 @@ fn get_o200k() -> Option<&'static CoreBPE> {
 /// Falls back to `aphelion_core::diet_gc::estimate_calibrated_tokens` if tokenizer init fails.
 pub fn count_tokens_for_model(model: &str, text: &str) -> usize {
     let m = model.to_ascii_lowercase();
-    let bpe = if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("o1") || m.contains("o3")
-    {
-        get_o200k().or_else(get_cl100k)
-    } else {
-        get_cl100k()
-    };
+    let bpe =
+        if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("o1") || m.contains("o3") {
+            get_o200k().or_else(get_cl100k)
+        } else {
+            get_cl100k()
+        };
 
     if let Some(encoder) = bpe {
         let raw = encoder.encode_with_special_tokens(text).len();

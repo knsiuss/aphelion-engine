@@ -1,3 +1,4 @@
+use crate::prefix_ledger::{should_run_macro_compaction, PrefixLedger};
 use crate::types::{NormalizedRequest, SessionState};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -58,13 +59,20 @@ pub fn estimate_calibrated_tokens(text: &str) -> usize {
     tokens
 }
 
-/// Collapses superseded tool outputs into deterministic `[AgentDiet Tombstone: ...]` markers
-/// ONLY when `B_stale >= 4,000` tokens, while pinning the most recent `read_file` of any
-/// file path or symbol actively referenced in the final 2 turns.
+/// Amortized Macro-Compaction Only: disables per-turn micro-GC on historical turns so
+/// upstream KV-caches are never invalidated mid-trajectory. Only runs a compaction checkpoint
+/// when total context >= 120,000 BPE tokens AND `re_prefill_tokens * 10 < projected_saved_reads`.
 pub fn compact_if_amortized(ir: &mut NormalizedRequest, state: &SessionState) {
     if ir.is_turn_zero || state.sacred_cache_boundary > 0 {
         return;
     }
+    let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
+    let breaker_tripped = state
+        .prefix_ledger
+        .get(&key)
+        .map(|r| r.cache_drop_breaker_tripped)
+        .unwrap_or(false);
+
     let Some(messages) = ir.root.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -103,11 +111,14 @@ pub fn compact_if_amortized(ir: &mut NormalizedRequest, state: &SessionState) {
         }
     }
 
-    if stale_tokens >= CACHE_AMORTIZATION_WATERMARK_TOKENS {
+    if stale_tokens >= CACHE_AMORTIZATION_WATERMARK_TOKENS
+        && should_run_macro_compaction(messages, stale_tokens, 12, breaker_tripped)
+    {
         ir.stage_stats.diet_gc_compacted_tokens = stale_tokens;
+        ir.stage_stats.macro_compaction_triggered = true;
         for (idx, kind, lines) in candidates {
             messages[idx]["content"] = Value::String(format!(
-                "[AgentDiet Tombstone: {kind} ({lines} lines) compacted; saved {stale_tokens} BPE tok]"
+                "[AgentDiet Tombstone: {kind} ({lines} lines) compacted at 120k checkpoint; saved {stale_tokens} BPE tok]"
             ));
         }
     }
@@ -120,7 +131,11 @@ fn collect_pinned_read_indices(messages: &[Value]) -> HashSet<usize> {
     for msg in messages.iter().rev().take(2) {
         let serialized = msg.to_string();
         for tok in serialized.split(|c: char| {
-            c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '{' | '}' | '[' | ']')
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | ',' | ';' | '(' | ')' | '{' | '}' | '[' | ']'
+                )
         }) {
             if is_file_path_like(tok) {
                 active_refs.insert(tok.to_owned());
@@ -137,7 +152,10 @@ fn collect_pinned_read_indices(messages: &[Value]) -> HashSet<usize> {
             continue;
         }
         let name = msg.get("name").and_then(Value::as_str).unwrap_or_default();
-        let content = msg.get("content").and_then(Value::as_str).unwrap_or_default();
+        let content = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !name.contains("read") && !content.starts_with("File:") {
             continue;
         }
@@ -221,7 +239,9 @@ fn has_later_passing_test(messages: &[Value]) -> bool {
     messages.iter().rev().take(3).any(|m| {
         m.get("content")
             .and_then(Value::as_str)
-            .map(|c| c.contains("test result: ok") || c.contains("PASSED") || c.contains("0 failed"))
+            .map(|c| {
+                c.contains("test result: ok") || c.contains("PASSED") || c.contains("0 failed")
+            })
             .unwrap_or(false)
     })
 }

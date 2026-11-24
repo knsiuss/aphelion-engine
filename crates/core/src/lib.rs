@@ -4,12 +4,15 @@
 pub mod canonicalizer;
 pub mod composer;
 pub mod compressor;
+pub mod compressor_rules;
 pub mod diet_gc;
 pub mod economizer;
 pub mod economizer_rules;
+pub mod ingress_opt;
 pub mod normalizer;
 pub mod optical_history;
 pub mod patcher;
+pub mod prefix_ledger;
 pub mod sse_dialect;
 pub mod stream_fsm;
 pub mod tron_codec;
@@ -19,6 +22,7 @@ pub mod validator;
 pub mod verifier;
 pub mod workload;
 
+use prefix_ledger::PrefixLedger;
 use stream_fsm::StreamFsm;
 use thiserror::Error;
 use types::{ExecutionProfile, PipelineFlags, SessionState, TransformedPayload, WorkloadClass};
@@ -44,8 +48,9 @@ pub fn prepare_request(
     prepare_request_with_flags(raw_json, profile, state, PipelineFlags::all())
 }
 
-/// Stage-configurable entry point routing strictly by `WorkloadClass` so non-agentic
-/// single-turn RAG/chat and structured-output traffic never receives agentic injections.
+/// Stage-configurable entry point enforcing Append-Only Prefix Invariance:
+/// frozen history `0..ingress_start` is replayed verbatim from `PrefixLedger`, and all
+/// compression/TRON/governance runs strictly on newly appended ingress messages `>= ingress_start`.
 pub fn prepare_request_with_flags(
     raw_json: &[u8],
     profile: ExecutionProfile,
@@ -61,37 +66,61 @@ pub fn prepare_request_with_flags(
         canonicalizer::apply_prefix_lock(&mut ir, state)?;
     }
 
+    // Cache-Drop Circuit Breaker: lock session into pure `FrozenPrefixPass` mode if tripped.
+    let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
+    let breaker_tripped = state
+        .prefix_ledger
+        .get(&key)
+        .map(|r| r.cache_drop_breaker_tripped)
+        .unwrap_or(false);
+    if breaker_tripped {
+        ir.stage_stats.cache_drop_breaker_active = true;
+        return composer::compose_outbound(ir, state, flags);
+    }
+
+    let has_new_ingress = ir
+        .root
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len() > ir.ingress_start)
+        .unwrap_or(true);
+
     match ir.workload {
         WorkloadClass::SingleTurnRagOrChat | WorkloadClass::StructuredOutput => {
-            if flags.llmlingua_prose {
+            if flags.llmlingua_prose && has_new_ingress {
                 compressor::compress_masked_prose(&mut ir, profile, state);
             }
         }
         WorkloadClass::DirectCodeEdit => {
-            if flags.llmlingua_prose {
+            if flags.llmlingua_prose && has_new_ingress {
                 compressor::compress_masked_prose(&mut ir, profile, state);
             }
-            if flags.ast_block_priming {
+            if flags.ast_block_priming && has_new_ingress {
                 verifier::analyze_and_anchor(&mut ir, state);
             }
         }
         WorkloadClass::AgenticLoop => {
+            if flags.tron_codec || flags.diet_gc {
+                let mut record = state.prefix_ledger.get_or_insert_mut(key).clone();
+                ingress_opt::optimize_ingress_messages(&mut ir, &mut record, profile);
+                state.prefix_ledger.restore_record(
+                    PrefixLedger::active_key(state.session_id, &ir.model_id),
+                    record,
+                );
+            }
             if flags.diet_gc {
                 diet_gc::compact_if_amortized(&mut ir, state);
             }
             if flags.optical_history {
                 optical_history::rasterize_if_eligible(&mut ir, state);
             }
-            if flags.llmlingua_prose {
+            if flags.llmlingua_prose && has_new_ingress {
                 compressor::compress_masked_prose(&mut ir, profile, state);
-            }
-            if flags.tron_codec {
-                tron_codec::transcode_inbound_tool_results(&mut ir);
             }
             if flags.economizer_gates {
                 economizer::apply_governance(&mut ir, state);
             }
-            if flags.ast_block_priming {
+            if flags.ast_block_priming && has_new_ingress {
                 verifier::analyze_and_anchor(&mut ir, state);
             }
         }
@@ -102,10 +131,6 @@ pub fn prepare_request_with_flags(
 }
 
 /// Incremental SSE / NDJSON chunk processor wrapping `StreamFsm` for wire-level adapters.
-pub fn process_sse_chunk(
-    fsm: &mut StreamFsm,
-    chunk: &[u8],
-    session: &mut SessionState,
-) -> Vec<u8> {
+pub fn process_sse_chunk(fsm: &mut StreamFsm, chunk: &[u8], session: &mut SessionState) -> Vec<u8> {
     fsm.process_sse_chunk(chunk, session)
 }
