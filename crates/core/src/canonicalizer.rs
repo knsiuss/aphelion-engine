@@ -1,4 +1,4 @@
-use crate::prefix_ledger::{replay_frozen_history, PrefixLedger};
+use crate::prefix_ledger::replay_frozen_history;
 use crate::types::{NormalizedRequest, SessionState};
 use crate::CoreError;
 use serde_json::{Map, Value};
@@ -20,7 +20,7 @@ pub fn apply_prefix_lock(
     state: &mut SessionState,
 ) -> Result<(), CoreError> {
     state.sacred_cache_boundary = state.sacred_cache_boundary.max(ir.sacred_boundary);
-    let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
+    let key = state.ledger_key(&ir.model_id);
 
     // Explicit `cache_control` breakpoints are Sacred Read-Only Zones: zero reordering.
     if state.sacred_cache_boundary > 0 {

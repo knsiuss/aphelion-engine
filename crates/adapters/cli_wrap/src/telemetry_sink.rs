@@ -1,20 +1,12 @@
 use crate::headers::extract_model;
 use crate::proxy::ProxyState;
-use aphelion_core::patcher::reconstruct_from_patch;
-use aphelion_core::prefix_ledger::PrefixLedger;
-use aphelion_core::stream_fsm::StreamFsm;
-use aphelion_core::types::{ExecutionProfile, SlmRouteDecision, UpstreamUsage};
+use aphelion_core::types::{ExecutionProfile, RequestOptions, SlmRouteDecision, UpstreamUsage};
 use aphelion_telemetry::audit::AuditRecord;
 use aphelion_telemetry::bpe::count_payload_tokens;
 use aphelion_telemetry::ledger::{PricingRates, TurnTelemetry};
 use bytes::Bytes;
-use futures_util::StreamExt;
-use http_body_util::StreamBody;
-use hyper::body::Frame;
-use hyper::{Response, StatusCode};
 use std::convert::Infallible;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
@@ -28,21 +20,27 @@ pub struct PendingTurn {
     pub fallback_cache_read: usize,
     pub slm_routed: bool,
     pub circuit_breaker_tripped: bool,
+    pub compaction_triggered: bool,
+    pub compaction_tokens_reclaimed: usize,
     pub prompt_text: String,
     pub started_at: Instant,
 }
 
-pub fn prepare_outbound(state: &ProxyState, raw_body: &[u8]) -> (Vec<u8>, Option<PendingTurn>) {
+pub fn prepare_outbound(
+    state: &ProxyState,
+    raw_body: &[u8],
+    opts: RequestOptions,
+) -> (Vec<u8>, Option<PendingTurn>) {
     let model = extract_model(raw_body);
     let raw_tok = count_payload_tokens(&model, raw_body);
     let Ok(mut guard) = state.session.lock() else {
         return (raw_body.to_vec(), None);
     };
     guard.last_usage = None;
+    guard.request_options = opts;
 
-    // Restore persisted PrefixLedger entry from SQLite if present.
-    if let (Some(sid), Some(audit_lock)) = (guard.session_id, &state.audit) {
-        let key = PrefixLedger::active_key(Some(sid), &model);
+    if let (Some(_), Some(audit_lock)) = (guard.session_id, &state.audit) {
+        let key = guard.ledger_key(&model);
         if guard.prefix_ledger.get(&key).is_none() {
             if let Ok(db) = audit_lock.lock() {
                 if let Some(saved) = db.load_prefix_record(&key) {
@@ -59,7 +57,7 @@ pub fn prepare_outbound(state: &ProxyState, raw_body: &[u8]) -> (Vec<u8>, Option
     };
 
     if let Some(audit_lock) = &state.audit {
-        let key = PrefixLedger::active_key(guard.session_id, &model);
+        let key = guard.ledger_key(&model);
         if let Some(rec) = guard.prefix_ledger.get(&key) {
             if let Ok(db) = audit_lock.lock() {
                 let _ = db.save_prefix_record(&key, rec);
@@ -73,6 +71,13 @@ pub fn prepare_outbound(state: &ProxyState, raw_body: &[u8]) -> (Vec<u8>, Option
     } else {
         0
     };
+    let st = &transformed.metrics.stage_stats;
+    if st.macro_compaction_triggered {
+        state
+            .metrics
+            .compactions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let pending = PendingTurn {
         session_id: transformed.metrics.session_id_hex,
         turn_index: guard.turn_index,
@@ -84,7 +89,9 @@ pub fn prepare_outbound(state: &ProxyState, raw_body: &[u8]) -> (Vec<u8>, Option
             transformed.metrics.slm_route,
             SlmRouteDecision::CompiledSlm { .. }
         ),
-        circuit_breaker_tripped: transformed.metrics.stage_stats.circuit_breaker_tripped,
+        circuit_breaker_tripped: st.circuit_breaker_tripped,
+        compaction_triggered: st.macro_compaction_triggered,
+        compaction_tokens_reclaimed: st.compaction_tokens_reclaimed,
         prompt_text: String::from_utf8_lossy(raw_body).into_owned(),
         started_at: Instant::now(),
     };
@@ -111,12 +118,29 @@ pub fn finalize_turn(
         turn.opt_tokens.saturating_sub(cache_read)
     };
 
+    state
+        .metrics
+        .uncached_input_tokens
+        .fetch_add(uncached as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .cached_read_tokens
+        .fetch_add(cache_read as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .output_tokens
+        .fetch_add(u.output_tokens as u64, Ordering::Relaxed);
+    state
+        .metrics
+        .reasoning_tokens
+        .fetch_add(u.reasoning_tokens as u64, Ordering::Relaxed);
+
     let mut breaker_tripped = false;
     if let Ok(mut guard) = state.session.lock() {
         if u.input_tokens > 0 {
             guard.record_upstream_usage(&u);
         }
-        let key = PrefixLedger::active_key(guard.session_id, &turn.model);
+        let key = guard.ledger_key(&turn.model);
         if let Some(rec) = guard.prefix_ledger.get(&key) {
             breaker_tripped = rec.cache_drop_breaker_tripped;
             if let Some(audit_lock) = &state.audit {
@@ -160,89 +184,11 @@ pub fn finalize_turn(
                 slm_routed: turn.slm_routed,
                 circuit_breaker_tripped: turn.circuit_breaker_tripped,
                 cache_drop_breaker_tripped: breaker_tripped,
+                compaction_triggered: turn.compaction_triggered,
+                compaction_tokens_reclaimed: turn.compaction_tokens_reclaimed,
                 prompt_text: turn.prompt_text,
                 response_text,
             });
         }
     }
-}
-
-pub fn apply_non_streaming_patch(json: &mut serde_json::Value, state: &ProxyState) -> bool {
-    let Some(content) = json
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .filter(|s| s.trim_start().starts_with("@patch:@block:"))
-        .map(str::to_owned)
-    else {
-        return false;
-    };
-    let Ok(guard) = state.session.lock() else {
-        return false;
-    };
-    if let Some(reconstructed) = reconstruct_from_patch(&content, &guard.known_blocks) {
-        if let Some(slot) = json.pointer_mut("/choices/0/message/content") {
-            *slot = serde_json::Value::String(reconstructed);
-            return true;
-        }
-    }
-    false
-}
-
-pub fn stream_sse_response(
-    status: StatusCode,
-    content_type: String,
-    upstream_res: reqwest::Response,
-    state: Arc<ProxyState>,
-    pending: Option<PendingTurn>,
-) -> Response<BoxBody> {
-    let fsm = Arc::new(Mutex::new(StreamFsm::default()));
-    let pending_cell = Arc::new(Mutex::new(pending));
-    let ttft_cell = Arc::new(Mutex::new(None::<u64>));
-
-    let byte_stream = upstream_res.bytes_stream().then(move |item| {
-        let (state, fsm, pending_cell, ttft_cell) = (
-            Arc::clone(&state),
-            Arc::clone(&fsm),
-            Arc::clone(&pending_cell),
-            Arc::clone(&ttft_cell),
-        );
-        async move {
-            let chunk = item.unwrap_or_default();
-            if let Ok(mut t) = ttft_cell.lock() {
-                if t.is_none() {
-                    if let Ok(p) = pending_cell.lock() {
-                        if let Some(ref turn) = *p {
-                            *t = Some(turn.started_at.elapsed().as_millis() as u64);
-                        }
-                    }
-                }
-            }
-            let processed = if let (Ok(mut f), Ok(mut s)) = (fsm.lock(), state.session.lock()) {
-                aphelion_core::process_sse_chunk(&mut f, &chunk, &mut s)
-            } else {
-                chunk.to_vec()
-            };
-            let is_terminal = processed.windows(6).any(|w| w == b"[DONE]")
-                || processed.windows(12).any(|w| w == b"message_stop")
-                || processed.windows(11).any(|w| w == b"\"done\":true");
-            if is_terminal {
-                if let Ok(mut p) = pending_cell.lock() {
-                    if let Some(turn) = p.take() {
-                        let usage = state.session.lock().ok().and_then(|s| s.last_usage.clone());
-                        let total_ms = turn.started_at.elapsed().as_millis() as u64;
-                        let ttft_ms = ttft_cell.lock().ok().and_then(|t| *t).unwrap_or(total_ms);
-                        finalize_turn(&state, turn, usage, ttft_ms, total_ms, String::new());
-                    }
-                }
-            }
-            Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(processed)))
-        }
-    });
-    let boxed: Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>> =
-        Box::pin(byte_stream);
-    Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(BoxBody::new(StreamBody::new(boxed)))
-        .expect("sse response builder")
 }

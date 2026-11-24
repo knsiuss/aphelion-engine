@@ -1,13 +1,25 @@
+use aphelion_cli::cli_audit::{print_summary, print_usage, run_audit_export, run_audit_summary};
 use aphelion_cli::headers::UpstreamTargets;
 use aphelion_cli::proxy::{run_proxy_server, ProxyState};
+use aphelion_cli::public_guard::PublicConfig;
+use aphelion_cli::router::run_doctor;
 use aphelion_cli::spawn::build_child_command;
 use aphelion_telemetry::audit::AuditLedger;
-use aphelion_telemetry::ledger::SessionCostSummary;
 use std::env;
-use std::fs::File;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+
+struct CliFlags {
+    audit: bool,
+    public: bool,
+    port: u16,
+    bind: Option<String>,
+    rpm: u32,
+    max_body_mb: usize,
+    upstream: Option<String>,
+    cmd_start: usize,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -15,6 +27,10 @@ async fn main() -> ExitCode {
     let db_path = env::var("APHELION_AUDIT_DB").unwrap_or_else(|_| "aphelion_audit.db".to_owned());
 
     match args.first().map(String::as_str) {
+        Some("doctor") => {
+            run_doctor();
+            return ExitCode::SUCCESS;
+        }
         Some("--audit-summary") => return run_audit_summary(&db_path),
         Some("--audit-export") => {
             let Some(out) = args.get(1) else {
@@ -35,21 +51,23 @@ async fn main() -> ExitCode {
         _ => {}
     }
 
-    let (audit_enabled, port, upstream_override, cmd_start) = parse_flags(&args, 0);
-    if cmd_start >= args.len() {
+    let flags = parse_flags(&args, 0);
+    if flags.cmd_start >= args.len() {
         print_usage();
         return ExitCode::from(2);
     }
 
-    let targets = build_upstream_targets(upstream_override.as_deref());
+    let targets = build_upstream_targets(flags.upstream.as_deref());
     let primary_upstream = targets.openai.clone();
-    let audit = open_audit_if(audit_enabled, &db_path);
-    let (listener, local_addr) = match bind_port(port).await {
-        Some(pair) => pair,
-        None => return ExitCode::from(1),
+    let audit = open_audit_if(flags.audit, &db_path);
+    let bind_addr = flags
+        .bind
+        .unwrap_or_else(|| format!("127.0.0.1:{}", flags.port));
+    let Some((listener, local_addr)) = bind_addr_socket(&bind_addr).await else {
+        return ExitCode::from(1);
     };
 
-    if audit_enabled {
+    if flags.audit {
         eprintln!("[aphelion] listening on http://{local_addr} -> {primary_upstream}");
     }
 
@@ -57,12 +75,19 @@ async fn main() -> ExitCode {
     let server_task = tokio::spawn(run_proxy_server(listener, Arc::clone(&state)));
 
     let proxy_base = format!("http://{local_addr}");
-    let mut cmd = build_child_command(&args[cmd_start], &args[cmd_start + 1..], &proxy_base);
+    let mut cmd = build_child_command(
+        &args[flags.cmd_start],
+        &args[flags.cmd_start + 1..],
+        &proxy_base,
+    );
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
             server_task.abort();
-            eprintln!("[aphelion] failed to launch `{}`: {err}", args[cmd_start]);
+            eprintln!(
+                "[aphelion] failed to launch `{}`: {err}",
+                args[flags.cmd_start]
+            );
             return ExitCode::from(1);
         }
     };
@@ -78,17 +103,31 @@ async fn main() -> ExitCode {
 }
 
 async fn run_gateway_mode(args: &[String], db_path: &str) -> ExitCode {
-    let (audit_enabled, port, upstream_override, _) = parse_flags(args, 18787);
-    let targets = build_upstream_targets(upstream_override.as_deref());
+    let flags = parse_flags(args, 18787);
+    let targets = build_upstream_targets(flags.upstream.as_deref());
     let primary = targets.openai.clone();
-    let audit = open_audit_if(audit_enabled, db_path);
-    let (listener, local_addr) = match bind_port(port).await {
-        Some(pair) => pair,
-        None => return ExitCode::from(1),
+    let audit = open_audit_if(flags.audit, db_path);
+    let default_host = if flags.public { "0.0.0.0" } else { "127.0.0.1" };
+    let bind_addr = flags
+        .bind
+        .unwrap_or_else(|| format!("{default_host}:{}", flags.port));
+    let Some((listener, local_addr)) = bind_addr_socket(&bind_addr).await else {
+        return ExitCode::from(1);
     };
 
-    eprintln!("[aphelion] listening on http://{local_addr} -> {primary}");
-    let state = Arc::new(ProxyState::with_targets(targets, audit.map(Mutex::new)));
+    let pub_cfg = PublicConfig {
+        public_mode: flags.public,
+        rpm_limit: flags.rpm,
+        max_body_bytes: flags.max_body_mb.saturating_mul(1024 * 1024),
+    };
+    let mode_tag = if flags.public { "public" } else { "local" };
+    eprintln!("[aphelion v3] listening on http://{local_addr} (mode={mode_tag}) -> {primary}");
+
+    let state = Arc::new(ProxyState::with_config(
+        targets,
+        pub_cfg,
+        audit.map(Mutex::new),
+    ));
     let server_task = tokio::spawn(run_proxy_server(listener, Arc::clone(&state)));
     let _ = tokio::signal::ctrl_c().await;
     server_task.abort();
@@ -96,29 +135,51 @@ async fn run_gateway_mode(args: &[String], db_path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse_flags(args: &[String], default_port: u16) -> (bool, u16, Option<String>, usize) {
-    let mut audit = false;
-    let mut port = default_port;
-    let mut upstream = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+fn parse_flags(args: &[String], default_port: u16) -> CliFlags {
+    let mut f = CliFlags {
+        audit: false,
+        public: false,
+        port: default_port,
+        bind: None,
+        rpm: 120,
+        max_body_mb: 10,
+        upstream: None,
+        cmd_start: 0,
+    };
+    while f.cmd_start < args.len() {
+        match args[f.cmd_start].as_str() {
             "--audit" => {
-                audit = true;
-                i += 1;
+                f.audit = true;
+                f.cmd_start += 1;
             }
-            "--port" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(default_port);
-                i += 2;
+            "--public" => {
+                f.public = true;
+                f.cmd_start += 1;
             }
-            "--upstream" if i + 1 < args.len() => {
-                upstream = Some(args[i + 1].clone());
-                i += 2;
+            "--port" if f.cmd_start + 1 < args.len() => {
+                f.port = args[f.cmd_start + 1].parse().unwrap_or(default_port);
+                f.cmd_start += 2;
+            }
+            "--bind" if f.cmd_start + 1 < args.len() => {
+                f.bind = Some(args[f.cmd_start + 1].clone());
+                f.cmd_start += 2;
+            }
+            "--rpm" if f.cmd_start + 1 < args.len() => {
+                f.rpm = args[f.cmd_start + 1].parse().unwrap_or(120);
+                f.cmd_start += 2;
+            }
+            "--max-body-mb" if f.cmd_start + 1 < args.len() => {
+                f.max_body_mb = args[f.cmd_start + 1].parse().unwrap_or(10);
+                f.cmd_start += 2;
+            }
+            "--upstream" if f.cmd_start + 1 < args.len() => {
+                f.upstream = Some(args[f.cmd_start + 1].clone());
+                f.cmd_start += 2;
             }
             _ => break,
         }
     }
-    (audit, port, upstream, i)
+    f
 }
 
 fn build_upstream_targets(override_url: Option<&str>) -> UpstreamTargets {
@@ -142,10 +203,10 @@ fn build_upstream_targets(override_url: Option<&str>) -> UpstreamTargets {
     }
 }
 
-async fn bind_port(port: u16) -> Option<(TcpListener, std::net::SocketAddr)> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.ok()?;
-    let addr = listener.local_addr().ok()?;
-    Some((listener, addr))
+async fn bind_addr_socket(addr: &str) -> Option<(TcpListener, std::net::SocketAddr)> {
+    let listener = TcpListener::bind(addr).await.ok()?;
+    let local = listener.local_addr().ok()?;
+    Some((listener, local))
 }
 
 fn open_audit_if(enabled: bool, db_path: &str) -> Option<AuditLedger> {
@@ -153,76 +214,4 @@ fn open_audit_if(enabled: bool, db_path: &str) -> Option<AuditLedger> {
         return None;
     }
     AuditLedger::open(db_path).ok()
-}
-
-fn run_audit_summary(db_path: &str) -> ExitCode {
-    let Ok(ledger) = AuditLedger::open(db_path) else {
-        eprintln!("[aphelion] no audit database found at {db_path}");
-        return ExitCode::SUCCESS;
-    };
-    match ledger.summarize() {
-        Ok(s) => {
-            println!("| Metric | Value |");
-            println!("| :--- | ---: |");
-            println!("| Total Requests | {} |", s.total_requests);
-            println!(
-                "| Uncached Input Tokens | {} |",
-                s.total_uncached_input_tokens
-            );
-            println!("| Cached Read Tokens | {} |", s.total_cache_read_tokens);
-            println!("| Cache Write Tokens | {} |", s.total_cache_creation_tokens);
-            println!("| Output Tokens | {} |", s.total_output_tokens);
-            println!("| Verified Cache-Hit % | {:.1}% |", s.cache_hit_pct());
-            println!(
-                "| Circuit-Breaker Trips | {} |",
-                s.total_circuit_breaker_trips
-            );
-            println!(
-                "| Cache-Drop Breaker Trips | {} |",
-                s.total_cache_drop_breaker_trips
-            );
-            println!("| BPE Tokens Saved (Ingress) | {} |", s.bpe_tokens_saved());
-            println!("| True Net Verified Saved | ${:.4} |", s.net_usd_saved());
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("[aphelion] failed reading audit summary: {err}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn run_audit_export(db_path: &str, out_path: &str) -> ExitCode {
-    let Ok(ledger) = AuditLedger::open(db_path) else {
-        return ExitCode::from(1);
-    };
-    let Ok(mut file) = File::create(out_path) else {
-        return ExitCode::from(1);
-    };
-    match ledger.export_jsonl(&mut file) {
-        Ok(n) => {
-            println!("[aphelion] exported {n} trajectories to {out_path}");
-            ExitCode::SUCCESS
-        }
-        Err(_) => ExitCode::from(1),
-    }
-}
-
-fn print_summary(summary: &SessionCostSummary) {
-    if summary.turns == 0 {
-        return;
-    }
-    eprintln!(
-        "\n[aphelion] session complete | turns={} | raw_tok={} -> opt_tok={} ({:.1}% saved) | cache_read={} | C_eff=${:.4} vs baseline=${:.4} ({:.1}% saved)",
-        summary.turns, summary.total_raw_tokens, summary.total_opt_tokens, summary.token_savings_pct(),
-        summary.total_cache_read_tokens, summary.optimized_cost_usd, summary.baseline_cost_usd, summary.cost_savings_pct(),
-    );
-}
-
-fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  aphelion [--audit] [--port <u16>] [--upstream <url>] <command> [args...]");
-    eprintln!("  aphelion serve [--port 18787] [--upstream <url>] [--audit]");
-    eprintln!("  aphelion --audit-summary");
-    eprintln!("  aphelion --audit-export <output.jsonl>");
 }

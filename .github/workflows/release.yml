@@ -36,7 +36,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: aphelion-darwin-arm64
-          - os: macos-13
+          - os: macos-14
             target: x86_64-apple-darwin
             asset: aphelion-darwin-x64
           - os: ubuntu-latest
@@ -91,6 +91,10 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret not set; skipping npm publish (GitHub Release binaries published)."
+            exit 0
+          fi
           mkdir -p packages/cli-npm/bin/native
           cp dist/* packages/cli-npm/bin/native/
           npm publish --access public ./packages/cli-npm

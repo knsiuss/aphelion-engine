@@ -1,3 +1,4 @@
+use aphelion_core::types::{CompactMode, RequestOptions};
 use flate2::read::GzDecoder;
 use hyper::HeaderMap;
 use reqwest::RequestBuilder;
@@ -10,7 +11,6 @@ pub struct UpstreamTargets {
     pub ollama: String,
 }
 
-/// Decodes incoming request body when `Content-Encoding: gzip` is present.
 pub fn decode_incoming_body(headers: &HeaderMap, raw: &[u8]) -> Vec<u8> {
     let is_gzip = headers
         .get("content-encoding")
@@ -37,8 +37,41 @@ pub fn has_bypass_header(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Copies safe headers to upstream while forcing `Accept-Encoding: identity`,
-/// recomputing `Content-Length`, and stripping internal `x-aphelion-*` routing headers.
+/// Parses per-request Aphelion control headers into `RequestOptions`.
+pub fn parse_request_options(
+    headers: &HeaderMap,
+    tenant_hash: u64,
+    provider_id: &str,
+) -> RequestOptions {
+    let output_verbose = headers
+        .get("x-aphelion-output-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("verbose"))
+        .unwrap_or(false);
+    let reasoning_effort = headers
+        .get("x-aphelion-reasoning-effort")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let compact_mode = headers
+        .get("x-aphelion-compact")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "force" => CompactMode::Force,
+            "off" => CompactMode::Off,
+            _ => CompactMode::Auto,
+        })
+        .unwrap_or(CompactMode::Auto);
+
+    RequestOptions {
+        tenant_hash,
+        provider_id: provider_id.to_owned(),
+        output_verbose,
+        reasoning_effort,
+        compact_mode,
+    }
+}
+
 pub fn apply_proxy_headers(
     mut builder: RequestBuilder,
     incoming: &HeaderMap,
@@ -55,6 +88,9 @@ pub fn apply_proxy_headers(
                 | "transfer-encoding"
                 | "x-aphelion-upstream"
                 | "x-aphelion-bypass"
+                | "x-aphelion-output-mode"
+                | "x-aphelion-reasoning-effort"
+                | "x-aphelion-compact"
         ) {
             continue;
         }
@@ -67,50 +103,7 @@ pub fn apply_proxy_headers(
         .header("content-length", body_len.to_string())
 }
 
-/// Resolves target upstream URL honoring:
-/// 1. Per-request `X-Aphelion-Upstream: <https://...>` header
-/// 2. Multi-provider path prefixes (`/openai/...`, `/anthropic/...`, `/gemini/...`, `/ollama/...`)
-/// 3. Automatic dialect path detection (`/messages`, `:generateContent`, `/api/`, default OpenAI).
-pub fn resolve_upstream_url(
-    targets: &UpstreamTargets,
-    headers: &HeaderMap,
-    path_and_query: &str,
-) -> String {
-    if let Some(override_base) = headers
-        .get("x-aphelion-upstream")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return join_base_path(override_base, path_and_query);
-    }
-
-    if let Some(rest) = path_and_query.strip_prefix("/openai") {
-        return join_base_path(&targets.openai, rest);
-    }
-    if let Some(rest) = path_and_query.strip_prefix("/anthropic") {
-        return join_base_path(&targets.anthropic, rest);
-    }
-    if let Some(rest) = path_and_query.strip_prefix("/gemini") {
-        return join_base_path(&targets.gemini, rest);
-    }
-    if let Some(rest) = path_and_query.strip_prefix("/ollama") {
-        return join_base_path(&targets.ollama, rest);
-    }
-
-    let base = if path_and_query.contains("/messages") {
-        &targets.anthropic
-    } else if path_and_query.contains("generateContent") {
-        &targets.gemini
-    } else if path_and_query.starts_with("/api/") {
-        &targets.ollama
-    } else {
-        &targets.openai
-    };
-    join_base_path(base, path_and_query)
-}
-
-fn join_base_path(base: &str, path: &str) -> String {
+pub fn join_base_path(base: &str, path: &str) -> String {
     let clean = base.trim_end_matches('/');
     if clean.ends_with("/v1") && path.starts_with("/v1") {
         format!("{}{}", clean.trim_end_matches("/v1"), path)

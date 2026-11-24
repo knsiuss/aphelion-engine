@@ -1,13 +1,11 @@
-use crate::prefix_ledger::PrefixLedger;
+use crate::prefix_ledger::{LedgerKey, PrefixLedger};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionProfile {
-    /// Short-lived CLI wrapper: forbids ONNX cold-start initialization (< 2ms CPU budget).
     Ephemeral,
-    /// Persistent router middleware or SDK: permits warm INT8 ONNX models in memory.
     LongLived,
 }
 
@@ -43,6 +41,23 @@ pub enum CodeLang {
     JavaScript,
     Python,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CompactMode {
+    #[default]
+    Auto,
+    Force,
+    Off,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestOptions {
+    pub tenant_hash: u64,
+    pub provider_id: String,
+    pub output_verbose: bool,
+    pub reasoning_effort: Option<String>,
+    pub compact_mode: CompactMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +127,7 @@ pub struct StageStats {
     pub circuit_breaker_tripped: bool,
     pub cache_drop_breaker_active: bool,
     pub macro_compaction_triggered: bool,
+    pub compaction_tokens_reclaimed: usize,
     pub micro_skill_injected: Option<String>,
     pub blocks_anchored: usize,
     pub validator_rollback: bool,
@@ -144,11 +160,21 @@ pub struct SessionState {
     pub active_micro_skill: Option<String>,
     pub prefix_ledger: PrefixLedger,
     pub active_model: String,
+    pub request_options: RequestOptions,
 }
 
 impl SessionState {
+    pub fn ledger_key(&self, model: &str) -> LedgerKey {
+        PrefixLedger::tenant_key(
+            self.request_options.tenant_hash,
+            self.session_id,
+            &self.request_options.provider_id,
+            model,
+        )
+    }
+
     pub fn record_upstream_usage(&mut self, usage: &UpstreamUsage) {
-        let key = PrefixLedger::active_key(self.session_id, &self.active_model);
+        let key = self.ledger_key(&self.active_model);
         let rec = self.prefix_ledger.get_or_insert_mut(key);
         rec.record_usage(
             usage.input_tokens,

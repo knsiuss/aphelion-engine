@@ -7,11 +7,14 @@ use std::collections::{HashMap, VecDeque};
 pub const MACRO_COMPACTION_WATERMARK_TOKENS: usize = 120_000;
 /// Minimum rolling cache-hit ratio on turns >= 3 before tripping `FrozenPrefixPass`.
 pub const CACHE_DROP_BREAKER_THRESHOLD: f64 = 0.70;
-const MAX_LEDGER_SESSIONS: usize = 256;
+const MAX_LEDGER_SESSIONS: usize = 512;
 
+/// Cryptographically tenant-isolated ledger key: `(tenant_hash, session_root_hash, provider_id, model_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LedgerKey {
+    pub tenant_hash: u64,
     pub session_root_hash: u128,
+    pub provider_id: String,
     pub model_id: String,
 }
 
@@ -21,6 +24,7 @@ pub struct FrozenSessionRecord {
     pub frozen_messages: Vec<Value>,
     pub frozen_file_hashes: HashMap<String, u64>,
     pub committed_len: usize,
+    pub compaction_epoch: u32,
     pub rolling_cached_read: usize,
     pub rolling_total_input: usize,
     pub usage_turns: usize,
@@ -36,8 +40,6 @@ impl FrozenSessionRecord {
         self.rolling_cached_read as f64 / self.rolling_total_input as f64
     }
 
-    /// Records real upstream usage and trips the Cache-Drop Circuit Breaker if
-    /// turns >= 3 and rolling `cache_hit_ratio < 0.70` on a cache-capable upstream.
     pub fn record_usage(&mut self, input_tokens: usize, cached_read: usize, cache_write: usize) {
         if input_tokens == 0 {
             return;
@@ -58,9 +60,8 @@ impl FrozenSessionRecord {
     }
 }
 
-/// Deterministic in-memory LRU `PrefixLedger` keyed by `(session_root_hash, model_id)`.
-/// Enforces the Append-Only History Lock: once messages `0..committed_len` are dispatched
-/// upstream, their canonical bytes are strictly immutable on all subsequent turns.
+/// Deterministic in-memory LRU `PrefixLedger` enforcing Append-Only Prefix Invariance
+/// and zero cross-tenant state sharing.
 #[derive(Debug, Clone, Default)]
 pub struct PrefixLedger {
     entries: HashMap<LedgerKey, FrozenSessionRecord>,
@@ -94,15 +95,30 @@ impl PrefixLedger {
     }
 
     pub fn active_key(session_id: Option<u128>, model: &str) -> LedgerKey {
+        Self::tenant_key(0, session_id, "default", model)
+    }
+
+    pub fn tenant_key(
+        tenant_hash: u64,
+        session_id: Option<u128>,
+        provider_id: &str,
+        model: &str,
+    ) -> LedgerKey {
         LedgerKey {
+            tenant_hash,
             session_root_hash: session_id.unwrap_or(0),
+            provider_id: if provider_id.is_empty() {
+                "default".to_owned()
+            } else {
+                provider_id.to_owned()
+            },
             model_id: model.to_owned(),
         }
     }
 }
 
 /// Replays strictly frozen historical messages `0..k` verbatim into `messages`,
-/// returning `ingress_start = k` (the first newly appended message eligible for optimization).
+/// returning `ingress_start = k`.
 pub fn replay_frozen_history(messages: &mut [Value], record: &FrozenSessionRecord) -> usize {
     let k = record.committed_len.min(record.frozen_messages.len());
     if k == 0 || messages.len() < k {
@@ -117,15 +133,11 @@ pub fn replay_frozen_history(messages: &mut [Value], record: &FrozenSessionRecor
     k
 }
 
-/// Commits all outbound messages `0..n` into `FrozenSessionRecord` so turn `t+1`
-/// replays their exact canonical post-optimization bytes with 100% prefix stability.
 pub fn commit_outbound_messages(messages: &[Value], record: &mut FrozenSessionRecord) {
     record.frozen_messages = messages.to_vec();
     record.committed_len = messages.len();
 }
 
-/// Evaluates whether a macro-compaction checkpoint is economically amortized:
-/// requires total context >= 120,000 BPE tokens AND `re_prefill_tokens * 10 < projected_saved_reads`.
 pub fn should_run_macro_compaction(
     messages: &[Value],
     stale_tokens: usize,

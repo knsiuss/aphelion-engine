@@ -1,10 +1,15 @@
 use crate::headers::{
-    apply_proxy_headers, decode_incoming_body, has_bypass_header, resolve_upstream_url,
+    apply_proxy_headers, decode_incoming_body, has_bypass_header, parse_request_options,
     UpstreamTargets,
 };
-use crate::telemetry_sink::{
-    apply_non_streaming_patch, finalize_turn, prepare_outbound, stream_sse_response, BoxBody,
+use crate::public_guard::{
+    extract_tenant_hash, render_health_json, MetricsRegistry, PublicConfig, SlidingWindowLimiter,
 };
+use crate::router::AutoRouter;
+use crate::sse_stream::{
+    apply_non_streaming_patch, reject_response, static_resp, stream_sse_response,
+};
+use crate::telemetry_sink::{finalize_turn, prepare_outbound, BoxBody};
 use aphelion_core::sse_dialect::extract_usage_from_json;
 use aphelion_core::types::SessionState;
 use aphelion_core::workload::is_passthrough_path;
@@ -19,11 +24,15 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 pub struct ProxyState {
     pub targets: UpstreamTargets,
+    pub public_cfg: PublicConfig,
+    pub limiter: SlidingWindowLimiter,
+    pub metrics: MetricsRegistry,
     pub client: Client,
     pub session: Mutex<SessionState>,
     pub summary: Mutex<SessionCostSummary>,
@@ -31,32 +40,34 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(
-        upstream_openai: String,
-        upstream_anthropic: String,
+    pub fn new(openai: String, anthropic: String, audit: Option<Mutex<AuditLedger>>) -> Self {
+        let t = UpstreamTargets {
+            openai,
+            anthropic,
+            gemini: "https://generativelanguage.googleapis.com".to_owned(),
+            ollama: "http://127.0.0.1:11434".to_owned(),
+        };
+        Self::with_config(t, PublicConfig::default(), audit)
+    }
+    pub fn with_targets(targets: UpstreamTargets, audit: Option<Mutex<AuditLedger>>) -> Self {
+        Self::with_config(targets, PublicConfig::default(), audit)
+    }
+    pub fn with_config(
+        targets: UpstreamTargets,
+        public_cfg: PublicConfig,
         audit: Option<Mutex<AuditLedger>>,
     ) -> Self {
-        Self::with_targets(
-            UpstreamTargets {
-                openai: upstream_openai,
-                anthropic: upstream_anthropic,
-                gemini: "https://generativelanguage.googleapis.com".to_owned(),
-                ollama: "http://127.0.0.1:11434".to_owned(),
-            },
-            audit,
-        )
-    }
-
-    pub fn with_targets(targets: UpstreamTargets, audit: Option<Mutex<AuditLedger>>) -> Self {
         Self {
             targets,
+            public_cfg,
+            limiter: SlidingWindowLimiter::default(),
+            metrics: MetricsRegistry::default(),
             client: Client::new(),
             session: Mutex::new(SessionState::default()),
             summary: Mutex::new(SessionCostSummary::default()),
             audit,
         }
     }
-
     pub fn summary_snapshot(&self) -> SessionCostSummary {
         self.summary.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -86,36 +97,75 @@ async fn handle_request(
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
+
+    if method == hyper::Method::GET && path_and_query == "/health" {
+        return Ok(static_resp(StatusCode::OK, "application/json", render_health_json(state.public_cfg.public_mode)));
+    }
+    if method == hyper::Method::GET && path_and_query == "/metrics" {
+        return Ok(static_resp(StatusCode::OK, "text/plain; version=0.0.4", state.metrics.render_prometheus()));
+    }
+
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let headers = req.headers().clone();
+
+    let tenant_hash = match extract_tenant_hash(&headers, state.public_cfg.public_mode) {
+        Ok(h) => h,
+        Err(rej) => return Ok(reject_response(rej, &state)),
+    };
+    if state.public_cfg.public_mode {
+        if let Err(rej) = state.limiter.check(tenant_hash, state.public_cfg.rpm_limit) {
+            return Ok(reject_response(rej, &state));
+        }
+    }
 
     let raw_bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => {
-            return Ok(error_response(
+            return Ok(static_resp(
                 StatusCode::BAD_REQUEST,
-                "failed reading body",
+                "text/plain",
+                "failed reading body".to_owned(),
             ))
         }
     };
+    if raw_bytes.len() > state.public_cfg.max_body_bytes {
+        return Ok(static_resp(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "text/plain",
+            "request body exceeds max limit".to_owned(),
+        ));
+    }
+
     let decoded_body = decode_incoming_body(&headers, &raw_bytes);
-    let target_url = resolve_upstream_url(&state.targets, &headers, &path_and_query);
+    let body_json = serde_json::from_slice::<serde_json::Value>(&decoded_body).ok();
+    let route = match AutoRouter::resolve(
+        &headers,
+        &path_and_query,
+        body_json.as_ref(),
+        &state.targets,
+        state.public_cfg.public_mode,
+    ) {
+        Ok(r) => r,
+        Err(rej) => return Ok(reject_response(rej, &state)),
+    };
 
     let should_bypass = method != hyper::Method::POST
         || decoded_body.is_empty()
         || has_bypass_header(&headers)
         || is_passthrough_path(&path_and_query);
 
+    let req_opts = parse_request_options(&headers, tenant_hash, &route.provider_id);
     let (outbound_body, pending) = if should_bypass {
         (decoded_body, None)
     } else {
-        prepare_outbound(&state, &decoded_body)
+        prepare_outbound(&state, &decoded_body, req_opts)
     };
 
     let req_method =
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let body_len = outbound_body.len();
     let upstream_req = apply_proxy_headers(
-        state.client.request(req_method, &target_url),
+        state.client.request(req_method, &route.target_url),
         &headers,
         body_len,
     )
@@ -125,9 +175,10 @@ async fn handle_request(
         Ok(r) => r,
         Err(err) => {
             eprintln!("[aphelion] upstream connection error: {err}");
-            return Ok(error_response(
+            return Ok(static_resp(
                 StatusCode::BAD_GATEWAY,
-                &format!("upstream error: {err}"),
+                "text/plain",
+                format!("upstream error: {err}"),
             ));
         }
     };
@@ -146,12 +197,11 @@ async fn handle_request(
             "[aphelion] upstream HTTP {} on {path_and_query}",
             status.as_u16()
         );
-        let resp = Response::builder()
+        return Ok(Response::builder()
             .status(status)
             .header("content-type", content_type)
             .body(BoxBody::new(Full::new(err_bytes)))
-            .unwrap_or_else(|_| error_response(status, "upstream error"));
-        return Ok(resp);
+            .expect("error response"));
     }
 
     if content_type.contains("text/event-stream") || content_type.contains("application/x-ndjson") {
@@ -185,19 +235,10 @@ async fn handle_request(
         }
     }
     let len = bytes.len();
-    let resp = Response::builder()
+    Ok(Response::builder()
         .status(status)
         .header("content-type", content_type)
         .header("content-length", len.to_string())
         .body(BoxBody::new(Full::new(Bytes::from(bytes))))
-        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "resp build err"));
-    Ok(resp)
-}
-
-fn error_response(status: StatusCode, msg: &str) -> Response<BoxBody> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "text/plain")
-        .body(BoxBody::new(Full::new(Bytes::from(msg.to_owned()))))
-        .expect("static response builder")
+        .expect("json response"))
 }

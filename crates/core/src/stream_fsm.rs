@@ -1,6 +1,10 @@
+use crate::output_opt::detect_consecutive_repeat;
 use crate::patcher;
 use crate::sse_dialect;
 use crate::types::SessionState;
+
+const LOOP_STOP_SSE: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsmState {
@@ -10,16 +14,14 @@ pub enum FsmState {
     PassThrough,
 }
 
-/// Zero-panic incremental byte-level SSE state machine.
-/// Supports OpenAI/DeepSeek (`reasoning_content`, `<think>`, `tool_calls`),
-/// Anthropic (`thinking_delta`, `text_delta`, `input_json_delta`),
-/// UTF-8 multi-byte boundary safety, and `@patch:@block` AST reconstruction.
 pub struct StreamFsm {
     pub state: FsmState,
+    pub loop_broken: bool,
     think_tail: Vec<u8>,
     sniff_buf: Vec<u8>,
     sse_line_buf: Vec<u8>,
     utf8_carry: Vec<u8>,
+    loop_ring: Vec<u8>,
     reasoning_active: bool,
 }
 
@@ -27,10 +29,12 @@ impl Default for StreamFsm {
     fn default() -> Self {
         Self {
             state: FsmState::SniffMode,
+            loop_broken: false,
             think_tail: Vec::with_capacity(320),
             sniff_buf: Vec::with_capacity(64),
             sse_line_buf: Vec::with_capacity(512),
             utf8_carry: Vec::with_capacity(4),
+            loop_ring: Vec::with_capacity(1024),
             reasoning_active: false,
         }
     }
@@ -39,6 +43,9 @@ impl Default for StreamFsm {
 impl StreamFsm {
     /// Processes arbitrarily split raw SSE (`data: {...}\n\n`) or Ollama NDJSON (`{...}\n`) chunks.
     pub fn process_sse_chunk(&mut self, chunk: &[u8], session: &mut SessionState) -> Vec<u8> {
+        if self.loop_broken {
+            return Vec::new();
+        }
         self.sse_line_buf.extend_from_slice(chunk);
         let mut output = Vec::new();
 
@@ -48,6 +55,10 @@ impl StreamFsm {
                     let frame: Vec<u8> = self.sse_line_buf.drain(..=nl).collect();
                     output
                         .extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
+                    if self.loop_broken {
+                        output.extend_from_slice(LOOP_STOP_SSE);
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -55,11 +66,29 @@ impl StreamFsm {
             if let Some(pos) = find_subslice(&self.sse_line_buf, b"\n\n") {
                 let frame: Vec<u8> = self.sse_line_buf.drain(..pos + 2).collect();
                 output.extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
+                if self.loop_broken {
+                    output.extend_from_slice(LOOP_STOP_SSE);
+                    break;
+                }
             } else {
                 break;
             }
         }
         output
+    }
+
+    pub fn record_emitted_text(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.loop_broken {
+            return;
+        }
+        self.loop_ring.extend_from_slice(bytes);
+        if self.loop_ring.len() > 1024 {
+            let excess = self.loop_ring.len() - 1024;
+            self.loop_ring.drain(..excess);
+        }
+        if detect_consecutive_repeat(&self.loop_ring, 64, 4) {
+            self.loop_broken = true;
+        }
     }
 
     pub fn force_passthrough(&mut self) {
@@ -182,18 +211,11 @@ impl StreamFsm {
     }
 }
 
-/// Returns the byte length of the longest valid UTF-8 prefix, leaving any incomplete trailing
-/// multi-byte sequence (1-3 bytes) for the next chunk without panicking or dropping bytes.
 fn utf8_complete_prefix_len(bytes: &[u8]) -> usize {
     match std::str::from_utf8(bytes) {
         Ok(_) => bytes.len(),
-        Err(err) => {
-            if err.error_len().is_none() {
-                err.valid_up_to()
-            } else {
-                bytes.len()
-            }
-        }
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(_) => bytes.len(),
     }
 }
 
@@ -205,19 +227,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn extract_terminal_sentences(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = trimmed
+    let parts: Vec<&str> = text
+        .trim()
         .split(['.', '!', '?'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    if parts.is_empty() {
-        return None;
-    }
     let take = parts.len().min(2);
-    let anchor = parts[parts.len() - take..].join(". ");
-    Some(format!("{anchor}."))
+    (take > 0).then(|| format!("{}.", parts[parts.len() - take..].join(". ")))
 }

@@ -1,4 +1,4 @@
-use crate::prefix_ledger::{should_run_macro_compaction, PrefixLedger};
+use crate::prefix_ledger::should_run_macro_compaction;
 use crate::types::{NormalizedRequest, SessionState};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -66,7 +66,7 @@ pub fn compact_if_amortized(ir: &mut NormalizedRequest, state: &SessionState) {
     if ir.is_turn_zero || state.sacred_cache_boundary > 0 {
         return;
     }
-    let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
+    let key = state.ledger_key(&ir.model_id);
     let breaker_tripped = state
         .prefix_ledger
         .get(&key)

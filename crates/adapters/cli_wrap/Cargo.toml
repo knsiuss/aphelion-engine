@@ -24,7 +24,12 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "signal"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[test]]
 name = "e2e_proxy"
 path = "../../../tests/e2e_proxy.rs"
+
+[[test]]
+name = "v3_gateway"
+path = "../../../tests/v3_gateway.rs"

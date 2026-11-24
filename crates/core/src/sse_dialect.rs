@@ -125,6 +125,7 @@ fn handle_openai_chunk(
 
     fsm.finalize_reasoning_if_active(session);
     let transformed = fsm.process_text_delta(content.as_bytes(), session);
+    fsm.record_emitted_text(&transformed);
     if transformed.is_empty() {
         return Vec::new();
     }

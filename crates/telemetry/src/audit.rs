@@ -32,6 +32,8 @@ pub struct AuditRecord {
     pub slm_routed: bool,
     pub circuit_breaker_tripped: bool,
     pub cache_drop_breaker_tripped: bool,
+    pub compaction_triggered: bool,
+    pub compaction_tokens_reclaimed: usize,
     pub prompt_text: String,
     pub response_text: String,
 }
@@ -73,6 +75,8 @@ impl AuditLedger {
                 slm_routed INTEGER NOT NULL,
                 circuit_breaker_tripped INTEGER NOT NULL DEFAULT 0,
                 cache_drop_breaker_tripped INTEGER NOT NULL DEFAULT 0,
+                compaction_triggered INTEGER NOT NULL DEFAULT 0,
+                compaction_tokens_reclaimed INTEGER NOT NULL DEFAULT 0,
                 prompt_text TEXT NOT NULL,
                 response_text TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -80,6 +84,8 @@ impl AuditLedger {
         )?;
         let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN uncached_input_tokens INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN cache_drop_breaker_tripped INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN compaction_triggered INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE flight_recorder ADD COLUMN compaction_tokens_reclaimed INTEGER NOT NULL DEFAULT 0", []);
         init_prefix_schema(conn)?;
         Ok(())
     }
@@ -104,15 +110,17 @@ impl AuditLedger {
                 uncached_input_tokens, cache_read_tokens, cache_creation_tokens,
                 output_tokens, reasoning_tokens, ttft_ms, total_ms, c_eff_usd,
                 slm_routed, circuit_breaker_tripped, cache_drop_breaker_tripped,
+                compaction_triggered, compaction_tokens_reclaimed,
                 prompt_text, response_text
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 rec.session_id, rec.turn_index as i64, rec.model, rec.raw_tokens as i64,
                 rec.opt_tokens as i64, rec.uncached_input_tokens as i64, rec.cache_read_tokens as i64,
                 rec.cache_creation_tokens as i64, rec.output_tokens as i64, rec.reasoning_tokens as i64,
                 rec.ttft_ms as i64, rec.total_ms as i64, rec.c_eff_usd,
                 i64::from(rec.slm_routed), i64::from(rec.circuit_breaker_tripped),
-                i64::from(rec.cache_drop_breaker_tripped), rec.prompt_text, rec.response_text,
+                i64::from(rec.cache_drop_breaker_tripped), i64::from(rec.compaction_triggered),
+                rec.compaction_tokens_reclaimed as i64, rec.prompt_text, rec.response_text,
             ],
         )?;
         Ok(())
@@ -124,6 +132,7 @@ impl AuditLedger {
                     uncached_input_tokens, cache_read_tokens, cache_creation_tokens,
                     output_tokens, reasoning_tokens, ttft_ms, total_ms, c_eff_usd,
                     slm_routed, circuit_breaker_tripped, cache_drop_breaker_tripped,
+                    compaction_triggered, compaction_tokens_reclaimed,
                     prompt_text, response_text
              FROM flight_recorder ORDER BY id ASC",
         )?;
@@ -145,8 +154,10 @@ impl AuditLedger {
                 slm_routed: row.get::<_, i64>(13)? != 0,
                 circuit_breaker_tripped: row.get::<_, i64>(14)? != 0,
                 cache_drop_breaker_tripped: row.get::<_, i64>(15)? != 0,
-                prompt_text: row.get(16)?,
-                response_text: row.get(17)?,
+                compaction_triggered: row.get::<_, i64>(16)? != 0,
+                compaction_tokens_reclaimed: row.get::<_, i64>(17)? as usize,
+                prompt_text: row.get(18)?,
+                response_text: row.get(19)?,
             })
         })?;
         let mut out = Vec::new();
@@ -172,11 +183,16 @@ impl AuditLedger {
             sum.total_cache_read_tokens += r.cache_read_tokens;
             sum.total_cache_creation_tokens += r.cache_creation_tokens;
             sum.total_output_tokens += r.output_tokens;
+            sum.total_reasoning_tokens += r.reasoning_tokens;
             if r.circuit_breaker_tripped {
                 sum.total_circuit_breaker_trips += 1;
             }
             if r.cache_drop_breaker_tripped {
                 sum.total_cache_drop_breaker_trips += 1;
+            }
+            if r.compaction_triggered {
+                sum.total_compactions += 1;
+                sum.total_compaction_reclaimed_tokens += r.compaction_tokens_reclaimed;
             }
 
             let actual_uncached = if r.uncached_input_tokens > 0 || r.cache_read_tokens > 0 {

@@ -1,4 +1,4 @@
-use crate::prefix_ledger::{commit_outbound_messages, PrefixLedger};
+use crate::prefix_ledger::commit_outbound_messages;
 use crate::types::{
     Complexity, Dialect, NormalizedRequest, PipelineFlags, SessionState, TransformMetrics,
     TransformedPayload, WorkloadClass,
@@ -79,7 +79,7 @@ pub fn compose_outbound(
     // Commit canonical outbound messages into PrefixLedger so next turn replays `0..n` verbatim.
     if flags.prefix_lock {
         if let Some(messages) = ir.root.get("messages").and_then(Value::as_array) {
-            let key = PrefixLedger::active_key(state.session_id, &ir.model_id);
+            let key = state.ledger_key(&ir.model_id);
             let rec = state.prefix_ledger.get_or_insert_mut(key);
             commit_outbound_messages(messages, rec);
         }
