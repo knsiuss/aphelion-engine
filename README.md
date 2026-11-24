@@ -1,45 +1,50 @@
 # Aphelion (`aphelion`) v1.0
 
-**Sans-I/O Symbiotic Token & Inference Optimization Engine for Coding Agents and Reasoning LLMs.**
+**Universal Sans-I/O Layer-3 AI Inference & Token Optimizer for Every Coding Agent, Router, SDK, and Non-Agentic Workload.**
 
-`aphelion` sits transparently at the wire-transformation layer (`Layer 3`) between coding agents (Claude Code, OpenCode, Cline, Aider) and LLM routers/backends (9Router, LiteLLM, vLLM, SGLang, Anthropic, OpenAI, DeepSeek). Instead of fighting model probability distributions with negative prompts or cache-busting history rewrites, it aligns payload bytes with **PagedAttention / RadixAttention KV-caching, RoPE attention windows, ViT patch caches, BPE subword tokenization, and Zero-HTTP-400 message-graph invariants**.
-
-```mermaid
-flowchart LR
-    Agent[Coding Agent\nClaude Code / OpenCode / Cline] -->|HTTP/1.1 + gzip/chunked| Proxy[Ephemeral CLI Proxy\n127.0.0.1:0 | Profile: Ephemeral]
-    Proxy --> Core[Pure Sans-I/O Core\nPrefixLock -> DietGC -> TRON -> Economizer -> Validator]
-    Core -->|S_prefix = 1.00| Upstream[(9Router / LiteLLM / vLLM / Frontier API)]
-    Upstream -->|SSE: OpenAI / DeepSeek / Anthropic| FSM[Zero-Panic StreamFsm\nThink Distiller + Usage + AST Patcher]
-    FSM --> Agent
-    Proxy -.->|--audit| SQLite[(aphelion_audit.db\nVerified Usage & Cache Hits)]
-```
+`aphelion` transparently optimizes OpenAI Chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), Google Gemini (`*:generateContent`), and Ollama (`/api/chat`, `/api/generate`) traffic—automatically routing **agentic loops**, **direct code edits**, **single-turn RAG/chat**, **structured JSON outputs**, and **transparent passthrough** (`/v1/models`, `/v1/embeddings`, `X-Aphelion-Bypass: true`) without ever injecting agentic directives into non-agentic requests.
 
 ---
 
-## 30-Second Quickstart
+## 30-Second Quickstarts
+
+### 1. Ephemeral CLI Wrapper (Windows `.exe`/`.cmd`/`.ps1` & POSIX)
+Zero daemon. Automatically resolves `opencode.cmd`, `claude.ps1`, `aider.exe`, etc., injects all provider base URLs, and prints net token/cache savings on exit:
 
 ```bash
-# 1. Wrap any coding agent CLI (zero background daemon, SQLite audit enabled)
-npx aphelion --audit claude
-# or via Cargo:
-cargo run --release -p aphelion-cli -- --audit claude
-
-# 2. Inspect verified upstream cache hits, BPE token savings, and net $ saved
-aphelion --audit-summary
-
-# 3. Export recorded trajectories for offline or live Shadow A/B benchmarking
-aphelion --audit-export session.jsonl
-cargo run --release -p aphelion-bench-harness -- --input session.jsonl
+aphelion --audit opencode
+aphelion --audit claude
+aphelion --audit --upstream http://localhost:20128/v1 claude   # chain to 9Router
+aphelion --audit-summary                                       # verified cache hits & $ saved
 ```
 
-### In-Process Router Middleware (`@aphelion/middleware` for 9Router / Node)
+### 2. Universal Gateway Mode (`aphelion serve`)
+Start a single local gateway for GUI IDEs, routers, SDKs, Chat UIs, and `curl`:
+
+```bash
+aphelion serve --port 18787 --upstream https://api.openai.com/v1 --audit
+```
+
+* **OpenCode (`opencode.json`) / Cursor / Cline / Roo Code:** Point your OpenAI/Anthropic provider `baseURL` to `http://127.0.0.1:18787/v1` (or `http://127.0.0.1:18787/anthropic`).
+* **Python `openai` SDK (non-agentic RAG / structured JSON):**
+  ```python
+  from openai import OpenAI
+  client = OpenAI(base_url="http://127.0.0.1:18787/v1")
+  ```
+* **Multi-Provider Path & Header Routing:**
+  - `/openai/...`, `/anthropic/...`, `/gemini/...`, `/ollama/...`
+  - Or pass `X-Aphelion-Upstream: https://custom-router.local/v1` per request (and `X-Aphelion-Bypass: true` to skip all transforms).
+* **Raw `curl`:**
+  ```bash
+  curl http://127.0.0.1:18787/v1/chat/completions -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "Content-Type: application/json" -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+  ```
+
+### 3. In-Process Router Middleware (`@aphelion/middleware`)
 
 ```js
 import { createAphelionMiddleware } from "@aphelion/middleware";
-
 const aphelion = createAphelionMiddleware({ profile: "LongLived" });
-const optimizedBody = aphelion.transformRequest(rawJsonBytes, { sessionId });
-const optimizedSse = aphelion.transformSseStream(upstreamResponse.body, { sessionId });
 ```
 
 ---
@@ -52,23 +57,12 @@ const optimizedSse = aphelion.transformSseStream(upstreamResponse.body, { sessio
 | `mcp_tool_heavy.jsonl` (25 tools + TRON + 3x loop) | 7,191 | 6,960 | **5.0%** (\$0.0007) | **36.3%** (\$0.0078) | **1.00** | **100%** |
 | `rag_long_context.jsonl` (RAG + code mask) | 1,748 | 1,255 | **28.2%** (\$0.0015) | 0.0% (\$0.0000) | **1.00** | **100%** |
 
-- **Criterion CPU Latency (`ExecutionProfile::Ephemeral`):** `266 µs` (10 KB) | **`1.35 ms` median / `1.38 ms` p99 CI (50 KB, `< 3 ms` budget PASS)** | `5.51 ms` (200 KB).
-
----
-
-## The 6 Non-Negotiable Hard Invariants
-
-1. **Zero Prefix Mutation:** Bytes `< frozen_prefix_len` and Anthropic `cache_control` spans are 100% immutable ($S_{\text{prefix}} = 1.00$).
-2. **Prefix-Safe Soft Tool-Gating Only:** `tools[]` schemas are never truncated or deleted after Turn-0; active tool narrowing happens solely via RoPE tail directives, with prefill/`@patch:@block` disabled in active tool loops.
-3. **BPE-Calibrated Cache Amortization:** Uses exact/calibrated BPE tokenizers (never `bytes / 4`) with `4,000`-token `AgentDiet` (plus Active-Reference Pinning) and `6,000`-token `AgentOCR` watermarks.
-4. **Lifecycle Cold-Start Guard:** `ExecutionProfile::Ephemeral` never initializes ONNX Runtime (`< 2 ms` pure-CPU lexical scorer).
-5. **Syntax-Masked & Format-Safe Compression:** Code fences, JSON/XML, stacktraces, paths, and `tools[]` are `0%` mutated; `TRON` applies only to inbound homogeneous JSON arrays in `tool_result`; `AgentOCR` never rasterizes active source code.
-6. **Never Starve Debugging + Zero-HTTP-400 Guard:** Stacktraces, failing tests, and Circuit-Breaker trips (`>= 2x` repeat with atomic pair collapse) unconditionally force `DEEP` reasoning; `validator.rs` verifies OpenAI/Anthropic message graphs pre-serialization and rolls back automatically on any violation.
+- **Criterion CPU Latency (`ExecutionProfile::Ephemeral`):** `266 µs` (10 KB) | **`1.35 ms` median / `1.38 ms` p99 CI (50 KB, `< 3 ms` PASS)** | `5.51 ms` (200 KB).
 
 ---
 
 ## Documentation
 
-* [`ARCHITECTURE.md`](./ARCHITECTURE.md) — Full `v0.8` specification, Mermaid diagrams, wire examples, and citations.
-* [`BENCHMARKS.md`](./BENCHMARKS.md) — Full 9-stage ablation tables, Criterion latencies, and `--live-ab` instructions.
-* [`AGENTS.md`](./AGENTS.md) — Engineering guardrails, `< 250` lines/file cap, and verification gates.
+* [`ARCHITECTURE.md`](./ARCHITECTURE.md) — Full `v0.8` specification, Mermaid diagrams, and research citations.
+* [`BENCHMARKS.md`](./BENCHMARKS.md) — Split-attribution 9-stage ablation tables, Criterion latencies, and `--live-ab`.
+* [`AGENTS.md`](./AGENTS.md) — The 6 Non-Negotiable Hard Invariants and `< 250` lines/file engineering guardrails.

@@ -11,6 +11,7 @@ pub fn validate_outbound_messages(dialect: Dialect, root: &Value) -> Result<(), 
     match dialect {
         Dialect::OpenAiChat => validate_openai(messages),
         Dialect::AnthropicMessages => validate_anthropic(messages),
+        _ => Ok(()),
     }
 }
 

@@ -13,7 +13,20 @@ pub enum ExecutionProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dialect {
     OpenAiChat,
+    OpenAiResponses,
     AnthropicMessages,
+    GeminiGenerate,
+    OllamaNative,
+    Passthrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkloadClass {
+    AgenticLoop,
+    DirectCodeEdit,
+    SingleTurnRagOrChat,
+    StructuredOutput,
+    Passthrough,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,11 +127,8 @@ pub struct SessionState {
     pub session_id: Option<u128>,
     pub turn_alias: Option<u64>,
     pub turn_index: usize,
-    /// Byte offset below which mutations are strictly forbidden.
     pub frozen_prefix_len: usize,
-    /// Snapshot of frozen prefix bytes from Turn-0 for invariant verification.
     pub frozen_prefix_bytes: Vec<u8>,
-    /// Explicit `cache_control` breakpoint byte boundary.
     pub sacred_cache_boundary: usize,
     pub last_thought_anchor: Option<String>,
     pub last_usage: Option<UpstreamUsage>,
@@ -132,7 +142,9 @@ pub struct SessionState {
 #[derive(Debug, Clone)]
 pub struct NormalizedRequest {
     pub dialect: Dialect,
+    pub workload: WorkloadClass,
     pub root: Value,
+    pub raw_passthrough: Option<Vec<u8>>,
     pub sacred_boundary: usize,
     pub is_turn_zero: bool,
     pub active_tool_loop: bool,
@@ -150,6 +162,8 @@ pub struct NormalizedRequest {
 pub struct TransformMetrics {
     pub session_id_hex: String,
     pub turn_alias: Option<u64>,
+    pub dialect: Dialect,
+    pub workload: WorkloadClass,
     pub frozen_prefix_len: usize,
     pub complexity_deep: bool,
     pub active_tool_loop: bool,

@@ -37,15 +37,26 @@ impl Default for StreamFsm {
 }
 
 impl StreamFsm {
-    /// Processes arbitrarily split raw SSE wire chunks (`data: {...}\n\n`).
+    /// Processes arbitrarily split raw SSE (`data: {...}\n\n`) or Ollama NDJSON (`{...}\n`) chunks.
     pub fn process_sse_chunk(&mut self, chunk: &[u8], session: &mut SessionState) -> Vec<u8> {
         self.sse_line_buf.extend_from_slice(chunk);
         let mut output = Vec::new();
 
-        while let Some(pos) = find_subslice(&self.sse_line_buf, b"\n\n") {
-            let frame: Vec<u8> = self.sse_line_buf.drain(..pos + 2).collect();
-            let processed = sse_dialect::process_sse_frame(self, &frame, session);
-            output.extend_from_slice(&processed);
+        loop {
+            if self.sse_line_buf.first() == Some(&b'{') {
+                if let Some(nl) = self.sse_line_buf.iter().position(|&b| b == b'\n') {
+                    let frame: Vec<u8> = self.sse_line_buf.drain(..=nl).collect();
+                    output.extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
+                    continue;
+                }
+                break;
+            }
+            if let Some(pos) = find_subslice(&self.sse_line_buf, b"\n\n") {
+                let frame: Vec<u8> = self.sse_line_buf.drain(..pos + 2).collect();
+                output.extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
+            } else {
+                break;
+            }
         }
         output
     }

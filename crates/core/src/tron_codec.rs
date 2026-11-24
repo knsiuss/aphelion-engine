@@ -2,9 +2,24 @@ use crate::types::NormalizedRequest;
 use serde_json::{Map, Value};
 
 /// Transcodes ONLY inbound homogeneous JSON arrays (>= 3 objects with identical keys)
-/// inside `tool_result` / `role == "tool"` payloads into tabular `@tron[k1,k2,...]`.
-/// Hard Invariant 5: outbound `tools[]` and `tool_calls` remain 100% standard JSON.
+/// inside `tool_result`, `role == "tool"`, or OpenAI Responses `function_call_output` payloads
+/// into tabular `@tron[k1,k2,...]`. Outbound `tools[]` and `tool_calls` remain 100% standard JSON.
 pub fn transcode_inbound_tool_results(ir: &mut NormalizedRequest) {
+    // OpenAI Responses API `input[]` items of type `function_call_output`
+    if let Some(items) = ir.root.get_mut("input").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                if let Some(raw) = item.get("output").and_then(Value::as_str) {
+                    if let Some(tron) = try_encode_tron_table(raw) {
+                        item["output"] = Value::String(tron);
+                        ir.stage_stats.tron_tables_encoded += 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let Some(messages) = ir.root.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };

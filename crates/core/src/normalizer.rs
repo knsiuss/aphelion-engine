@@ -1,34 +1,41 @@
 use crate::types::{
     Complexity, Dialect, NormalizedRequest, SessionState, SlmRouteDecision, StageStats,
+    WorkloadClass,
 };
+use crate::workload::{classify_workload, detect_dialect_universal};
 use crate::CoreError;
 use serde_json::Value;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
-/// Parses raw request bytes into a normalized IR and enforces Two-Phase Session Derivation.
+/// Parses raw request bytes into a normalized IR across all major LLM dialects.
+/// Unrecognized JSON schemas or non-JSON bodies degrade safely to `Dialect::Passthrough`
+/// (byte-for-byte untouched) with zero errors.
 pub fn normalize(raw_json: &[u8], state: &mut SessionState) -> Result<NormalizedRequest, CoreError> {
-    let root: Value = serde_json::from_slice(raw_json)?;
-    let dialect = detect_dialect(&root)?;
-
-    let messages = root
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or(CoreError::UnsupportedDialect)?;
+    let Ok(root) = serde_json::from_slice::<Value>(raw_json) else {
+        return Ok(passthrough_ir(raw_json));
+    };
+    let dialect = detect_dialect_universal(&root);
+    if dialect == Dialect::Passthrough {
+        return Ok(passthrough_ir(raw_json));
+    }
 
     let sacred_boundary = scan_cache_control_boundary(raw_json, &root);
     let is_turn_zero = state.session_id.is_none() || state.turn_index == 0;
-    let session_id = derive_two_phase_session(&root, messages, state);
+    let session_id = derive_two_phase_session(&root, dialect, state);
     state.session_id = Some(session_id);
 
-    let active_tool_loop = detect_active_tool_loop(&root, messages);
+    let active_tool_loop = detect_active_tool_loop(&root, dialect);
+    let workload = classify_workload(dialect, &root, active_tool_loop);
     let model = root.get("model").and_then(Value::as_str).unwrap_or_default();
     let supports_prefill = model_supports_prefill(model);
     let supports_vision = model_supports_vision(model);
-
     let pre_compaction_messages = root.get("messages").cloned();
+
     Ok(NormalizedRequest {
         dialect,
+        workload,
         root,
+        raw_passthrough: None,
         sacred_boundary,
         is_turn_zero,
         active_tool_loop,
@@ -43,15 +50,23 @@ pub fn normalize(raw_json: &[u8], state: &mut SessionState) -> Result<Normalized
     })
 }
 
-fn detect_dialect(root: &Value) -> Result<Dialect, CoreError> {
-    if root.get("anthropic_version").is_some()
-        || (root.get("max_tokens").is_some() && root.get("system").is_some())
-    {
-        Ok(Dialect::AnthropicMessages)
-    } else if root.get("messages").is_some() {
-        Ok(Dialect::OpenAiChat)
-    } else {
-        Err(CoreError::UnsupportedDialect)
+fn passthrough_ir(raw: &[u8]) -> NormalizedRequest {
+    NormalizedRequest {
+        dialect: Dialect::Passthrough,
+        workload: WorkloadClass::Passthrough,
+        root: Value::Null,
+        raw_passthrough: Some(raw.to_vec()),
+        sacred_boundary: 0,
+        is_turn_zero: false,
+        active_tool_loop: false,
+        complexity: Complexity::Trivial,
+        supports_prefill: false,
+        supports_vision: false,
+        tail_directives: Vec::new(),
+        assistant_prefill: None,
+        slm_route: SlmRouteDecision::Frontier,
+        stage_stats: StageStats::default(),
+        pre_compaction_messages: None,
     }
 }
 
@@ -67,32 +82,44 @@ fn scan_cache_control_boundary(raw_json: &[u8], root: &Value) -> usize {
     }
 }
 
-/// Phase 1 (Turn-0): XXH3_128(canonical(system) || workspace_fingerprint || first_user[0..512])
-/// Phase 2 (Turn-1+): binds `turn_alias = XXH3_64(first_assistant[0..256])` on first assistant turn.
-fn derive_two_phase_session(root: &Value, messages: &[Value], state: &mut SessionState) -> u128 {
+fn derive_two_phase_session(root: &Value, dialect: Dialect, state: &mut SessionState) -> u128 {
+    let messages = root.get("messages").and_then(Value::as_array);
     if let Some(existing) = state.session_id {
         if state.turn_alias.is_none() {
-            if let Some(first_asst) = messages
-                .iter()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            {
-                let slice = first_asst.to_string();
-                let end = slice.len().min(256);
-                state.turn_alias = Some(xxh3_64(&slice.as_bytes()[..end]));
+            if let Some(msgs) = messages {
+                if let Some(first_asst) = msgs
+                    .iter()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                {
+                    let slice = first_asst.to_string();
+                    state.turn_alias = Some(xxh3_64(&slice.as_bytes()[..slice.len().min(256)]));
+                }
             }
         }
         return existing;
     }
 
-    let sys = root.get("system").map(Value::to_string).unwrap_or_default();
+    let sys = match dialect {
+        Dialect::OpenAiResponses => root.get("instructions"),
+        Dialect::GeminiGenerate => root.get("systemInstruction"),
+        _ => root.get("system"),
+    }
+    .map(Value::to_string)
+    .unwrap_or_default();
+
     let first_user = messages
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .map(Value::to_string)
+        .and_then(|msgs| {
+            msgs.iter()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .map(Value::to_string)
+        })
+        .or_else(|| root.get("input").map(Value::to_string))
+        .or_else(|| root.get("contents").map(Value::to_string))
+        .or_else(|| root.get("prompt").map(Value::to_string))
         .unwrap_or_default();
+
     let workspace_fp = extract_workspace_fingerprint(&sys, &first_user);
     let end = first_user.len().min(512);
-
     let mut seed = Vec::with_capacity(sys.len() + workspace_fp.len() + end + 2);
     seed.extend_from_slice(sys.as_bytes());
     seed.push(b'|');
@@ -121,20 +148,20 @@ pub fn extract_workspace_fingerprint(system: &str, first_user: &str) -> String {
     String::new()
 }
 
-fn detect_active_tool_loop(root: &Value, messages: &[Value]) -> bool {
+fn detect_active_tool_loop(root: &Value, dialect: Dialect) -> bool {
     let has_tools = root
         .get("tools")
         .and_then(Value::as_array)
         .map(|t| !t.is_empty())
         .unwrap_or(false);
-    if !has_tools {
+    if !has_tools || root.get("tool_choice").and_then(Value::as_str) == Some("none") {
         return false;
     }
-    if root.get("tool_choice").and_then(Value::as_str) == Some("none") {
-        return false;
+    if dialect == Dialect::OpenAiResponses {
+        return true;
     }
-    let Some(last) = messages.last() else {
-        return false;
+    let Some(last) = root.get("messages").and_then(Value::as_array).and_then(|m| m.last()) else {
+        return has_tools;
     };
     let role = last.get("role").and_then(Value::as_str).unwrap_or_default();
     if role == "tool" {

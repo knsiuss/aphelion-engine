@@ -1,4 +1,5 @@
 use aphelion_cli::proxy::{run_proxy_server, ProxyState};
+use aphelion_cli::spawn::{resolve_windows_executable, ResolvedExec};
 use aphelion_core::canonicalizer::verify_prefix_invariant;
 use aphelion_telemetry::audit::AuditLedger;
 use bytes::Bytes;
@@ -39,6 +40,21 @@ async fn spawn_mock_upstream(captured: Arc<Mutex<Vec<Vec<u8>>>>) -> String {
                                     .body(Full::new(Bytes::from(r#"{"error":"rate_limited"}"#)))
                                     .unwrap(),
                             );
+                        }
+                        if path.contains("/v1/models") {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(r#"{"data":[{"id":"gpt-4o"}]}"#)))
+                                .unwrap());
+                        }
+                        if path.contains("/non-stream") {
+                            let body = r#"{"choices":[{"message":{"role":"assistant","content":"Non-stream ok"}}],"usage":{"prompt_tokens":100,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":80}}}"#;
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap());
                         }
                         if path.contains("/v1/messages") {
                             let sse = concat!(
@@ -153,10 +169,61 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
     assert_eq!(r_429.status(), 429);
     assert!(r_429.text().await.unwrap().contains("rate_limited"));
 
-    // 4. Verify SQLite Flight Recorder persisted real upstream cached_tokens & usage
+    // 4. Non-streaming JSON + X-Aphelion-Upstream + /v1/models GET passthrough + X-Aphelion-Bypass
+    let ns_body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "stream": false,
+        "messages": [{"role": "user", "content": "Hello non-streaming"}]
+    }))
+    .unwrap();
+    let r_ns = client
+        .post(format!("{base}/non-stream"))
+        .header("x-aphelion-upstream", &mock_base)
+        .body(ns_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ns.status(), 200);
+    assert!(r_ns.text().await.unwrap().contains("Non-stream ok"));
+
+    let r_models = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    assert_eq!(r_models.status(), 200);
+    assert!(r_models.text().await.unwrap().contains("gpt-4o"));
+
+    let raw_bypass = br#"{"raw":"untouched"}"#;
+    let r_byp = client
+        .post(format!("{base}/non-stream"))
+        .header("x-aphelion-bypass", "true")
+        .body(raw_bypass.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_byp.status(), 200);
+    assert_eq!(captured.lock().unwrap().last().unwrap(), raw_bypass);
+
+    // 5. Verify SQLite Flight Recorder persisted real upstream cached_tokens & usage
     let audit_sum = state.audit.as_ref().unwrap().lock().unwrap().summarize().unwrap();
-    assert_eq!(audit_sum.total_requests, 3);
-    assert!(audit_sum.total_cache_read_tokens >= 840);
+    assert_eq!(audit_sum.total_requests, 4);
+    assert!(audit_sum.total_cache_read_tokens >= 920);
 
     server.abort();
+}
+
+#[test]
+fn windows_pathext_resolves_exe_cmd_and_ps1_priority() {
+    let dir = std::env::temp_dir().join("aphelion_pathext_test");
+    let _ = std::fs::create_dir_all(&dir);
+    let cmd_file = dir.join("opencode.cmd");
+    let ps1_file = dir.join("claude.ps1");
+    let exe_file = dir.join("aider.exe");
+    std::fs::write(&cmd_file, "@echo off").unwrap();
+    std::fs::write(&ps1_file, "Write-Host hi").unwrap();
+    std::fs::write(&exe_file, "MZ").unwrap();
+
+    let exts = [".exe", ".cmd", ".bat", ".ps1"];
+    let dirs = std::slice::from_ref(&dir);
+    assert_eq!(resolve_windows_executable("opencode", dirs, &exts), Some(ResolvedExec::CmdBatch(cmd_file)));
+    assert_eq!(resolve_windows_executable("claude", dirs, &exts), Some(ResolvedExec::PowerShell(ps1_file)));
+    assert_eq!(resolve_windows_executable("aider", dirs, &exts), Some(ResolvedExec::Direct(exe_file)));
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -89,6 +89,10 @@ fn build_vision_block(dialect: Dialect, b64: &str, tokens: usize) -> Value {
             { "type": "text", "text": caption },
             { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": b64 } }
         ]),
+        _ => json!([
+            { "type": "text", "text": caption },
+            { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{b64}") } }
+        ]),
     }
 }
 

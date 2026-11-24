@@ -1,4 +1,6 @@
+use aphelion_cli::headers::UpstreamTargets;
 use aphelion_cli::proxy::{run_proxy_server, ProxyState};
+use aphelion_cli::spawn::build_child_command;
 use aphelion_telemetry::audit::AuditLedger;
 use aphelion_telemetry::ledger::SessionCostSummary;
 use std::env;
@@ -6,110 +8,142 @@ use std::fs::File;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use tokio::process::Command;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let db_path = env::var("APHELION_AUDIT_DB").unwrap_or_else(|_| "aphelion_audit.db".to_owned());
 
-    if let Some(first) = args.first().map(String::as_str) {
-        match first {
-            "--audit-summary" => return run_audit_summary(&db_path),
-            "--audit-export" => {
-                let Some(out_path) = args.get(1) else {
-                    eprintln!("Usage: aphelion --audit-export <output.jsonl>");
-                    return ExitCode::from(2);
-                };
-                return run_audit_export(&db_path, out_path);
-            }
-            "--help" | "-h" => {
-                print_usage();
-                return ExitCode::SUCCESS;
-            }
-            _ => {}
+    match args.first().map(String::as_str) {
+        Some("--audit-summary") => return run_audit_summary(&db_path),
+        Some("--audit-export") => {
+            let Some(out) = args.get(1) else {
+                eprintln!("Usage: aphelion --audit-export <output.jsonl>");
+                return ExitCode::from(2);
+            };
+            return run_audit_export(&db_path, out);
         }
+        Some("--help" | "-h") | None => {
+            print_usage();
+            return if args.is_empty() { ExitCode::from(2) } else { ExitCode::SUCCESS };
+        }
+        Some("serve") => return run_gateway_mode(&args[1..], &db_path).await,
+        _ => {}
     }
 
-    let mut audit_enabled = false;
-    let mut cmd_start = 0usize;
-    while cmd_start < args.len() && args[cmd_start] == "--audit" {
-        audit_enabled = true;
-        cmd_start += 1;
-    }
-
+    let (audit_enabled, port, upstream_override, cmd_start) = parse_flags(&args, 0);
     if cmd_start >= args.len() {
         print_usage();
         return ExitCode::from(2);
     }
 
-    let child_program = &args[cmd_start];
-    let child_args = &args[cmd_start + 1..];
-
-    let upstream_openai = env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
-    let upstream_anthropic = env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_owned());
-
-    let audit = if audit_enabled {
-        match AuditLedger::open(&db_path) {
-            Ok(db) => Some(db),
-            Err(err) => {
-                eprintln!("[aphelion] warning: failed to open audit db: {err}");
-                None
-            }
-        }
-    } else {
-        None
+    let targets = build_upstream_targets(upstream_override.as_deref());
+    let primary_upstream = targets.openai.clone();
+    let audit = open_audit_if(audit_enabled, &db_path);
+    let (listener, local_addr) = match bind_port(port).await {
+        Some(pair) => pair,
+        None => return ExitCode::from(1),
     };
 
-    let listener = match TcpListener::bind("127.0.0.1:0").await {
-        Ok(l) => l,
-        Err(err) => {
-            eprintln!("[aphelion] failed to bind ephemeral proxy port: {err}");
-            return ExitCode::from(1);
-        }
-    };
-    let Ok(local_addr) = listener.local_addr() else {
-        return ExitCode::from(1);
-    };
+    if audit_enabled {
+        eprintln!("[aphelion] listening on http://{local_addr} -> {primary_upstream}");
+    }
 
-    let state = Arc::new(ProxyState::new(
-        upstream_openai,
-        upstream_anthropic,
-        audit.map(Mutex::new),
-    ));
-    let server_state = Arc::clone(&state);
-    let server_task = tokio::spawn(async move {
-        run_proxy_server(listener, server_state).await;
-    });
+    let state = Arc::new(ProxyState::with_targets(targets, audit.map(Mutex::new)));
+    let server_task = tokio::spawn(run_proxy_server(listener, Arc::clone(&state)));
 
     let proxy_base = format!("http://{local_addr}");
-    let mut child = match Command::new(child_program)
-        .args(child_args)
-        .env("OPENAI_BASE_URL", format!("{proxy_base}/v1"))
-        .env("ANTHROPIC_BASE_URL", &proxy_base)
-        .spawn()
-    {
+    let mut cmd = build_child_command(&args[cmd_start], &args[cmd_start + 1..], &proxy_base);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
             server_task.abort();
-            eprintln!("[aphelion] failed to launch `{child_program}`: {err}");
+            eprintln!("[aphelion] failed to launch `{}`: {err}", args[cmd_start]);
             return ExitCode::from(1);
         }
     };
 
     let exit_code = tokio::select! {
         status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(0),
-        _ = tokio::signal::ctrl_c() => {
-            let _ = child.kill().await;
-            130
-        }
+        _ = tokio::signal::ctrl_c() => { let _ = child.kill().await; 130 }
     };
 
     server_task.abort();
     print_summary(&state.summary_snapshot());
     ExitCode::from(exit_code as u8)
+}
+
+async fn run_gateway_mode(args: &[String], db_path: &str) -> ExitCode {
+    let (audit_enabled, port, upstream_override, _) = parse_flags(args, 18787);
+    let targets = build_upstream_targets(upstream_override.as_deref());
+    let primary = targets.openai.clone();
+    let audit = open_audit_if(audit_enabled, db_path);
+    let (listener, local_addr) = match bind_port(port).await {
+        Some(pair) => pair,
+        None => return ExitCode::from(1),
+    };
+
+    eprintln!("[aphelion] listening on http://{local_addr} -> {primary}");
+    let state = Arc::new(ProxyState::with_targets(targets, audit.map(Mutex::new)));
+    let server_task = tokio::spawn(run_proxy_server(listener, Arc::clone(&state)));
+    let _ = tokio::signal::ctrl_c().await;
+    server_task.abort();
+    print_summary(&state.summary_snapshot());
+    ExitCode::SUCCESS
+}
+
+fn parse_flags(args: &[String], default_port: u16) -> (bool, u16, Option<String>, usize) {
+    let mut audit = false;
+    let mut port = default_port;
+    let mut upstream = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--audit" => {
+                audit = true;
+                i += 1;
+            }
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1].parse().unwrap_or(default_port);
+                i += 2;
+            }
+            "--upstream" if i + 1 < args.len() => {
+                upstream = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    (audit, port, upstream, i)
+}
+
+fn build_upstream_targets(override_url: Option<&str>) -> UpstreamTargets {
+    let openai = override_url
+        .map(str::to_owned)
+        .or_else(|| env::var("OPENAI_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
+    let anthropic = override_url
+        .map(str::to_owned)
+        .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.anthropic.com".to_owned());
+    let gemini = env::var("GEMINI_API_BASE_URL")
+        .or_else(|_| env::var("GOOGLE_GEMINI_BASE_URL"))
+        .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_owned());
+    let ollama = env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned());
+    UpstreamTargets { openai, anthropic, gemini, ollama }
+}
+
+async fn bind_port(port: u16) -> Option<(TcpListener, std::net::SocketAddr)> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await.ok()?;
+    let addr = listener.local_addr().ok()?;
+    Some((listener, addr))
+}
+
+fn open_audit_if(enabled: bool, db_path: &str) -> Option<AuditLedger> {
+    if !enabled {
+        return None;
+    }
+    AuditLedger::open(db_path).ok()
 }
 
 fn run_audit_summary(db_path: &str) -> ExitCode {
@@ -136,46 +170,27 @@ fn run_audit_summary(db_path: &str) -> ExitCode {
 }
 
 fn run_audit_export(db_path: &str, out_path: &str) -> ExitCode {
-    let Ok(ledger) = AuditLedger::open(db_path) else {
-        eprintln!("[aphelion] failed opening audit db at {db_path}");
-        return ExitCode::from(1);
-    };
-    let Ok(mut file) = File::create(out_path) else {
-        eprintln!("[aphelion] failed creating {out_path}");
-        return ExitCode::from(1);
-    };
+    let Ok(ledger) = AuditLedger::open(db_path) else { return ExitCode::from(1) };
+    let Ok(mut file) = File::create(out_path) else { return ExitCode::from(1) };
     match ledger.export_jsonl(&mut file) {
-        Ok(n) => {
-            println!("[aphelion] exported {n} trajectories to {out_path}");
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("[aphelion] export failed: {err}");
-            ExitCode::from(1)
-        }
+        Ok(n) => { println!("[aphelion] exported {n} trajectories to {out_path}"); ExitCode::SUCCESS }
+        Err(_) => ExitCode::from(1),
     }
 }
 
 fn print_summary(summary: &SessionCostSummary) {
-    if summary.turns == 0 {
-        return;
-    }
+    if summary.turns == 0 { return; }
     eprintln!(
         "\n[aphelion] session complete | turns={} | raw_tok={} -> opt_tok={} ({:.1}% saved) | cache_read={} | C_eff=${:.4} vs baseline=${:.4} ({:.1}% saved)",
-        summary.turns,
-        summary.total_raw_tokens,
-        summary.total_opt_tokens,
-        summary.token_savings_pct(),
-        summary.total_cache_read_tokens,
-        summary.optimized_cost_usd,
-        summary.baseline_cost_usd,
-        summary.cost_savings_pct(),
+        summary.turns, summary.total_raw_tokens, summary.total_opt_tokens, summary.token_savings_pct(),
+        summary.total_cache_read_tokens, summary.optimized_cost_usd, summary.baseline_cost_usd, summary.cost_savings_pct(),
     );
 }
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  aphelion [--audit] <command> [args...]");
+    eprintln!("  aphelion [--audit] [--port <u16>] [--upstream <url>] <command> [args...]");
+    eprintln!("  aphelion serve [--port 18787] [--upstream <url>] [--audit]");
     eprintln!("  aphelion --audit-summary");
     eprintln!("  aphelion --audit-export <output.jsonl>");
 }

@@ -34,6 +34,10 @@ path = "../../tests/fuzz_dialects.rs"
 name = "api_contracts"
 path = "../../tests/api_contracts.rs"
 
+[[test]]
+name = "universal_workloads"
+path = "../../tests/universal_workloads.rs"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 

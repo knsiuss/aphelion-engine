@@ -2,7 +2,14 @@ use crate::types::{NormalizedRequest, SessionState};
 use crate::CoreError;
 use serde_json::{Map, Value};
 
-const PREFIX_KEYS: &[&str] = &["anthropic_version", "model", "system", "tools"];
+const PREFIX_KEYS: &[&str] = &[
+    "anthropic_version",
+    "model",
+    "system",
+    "instructions",
+    "systemInstruction",
+    "tools",
+];
 
 /// Canonicalizes JSON keys on Turn-0 with static prefix keys (`anthropic_version`, `model`,
 /// `system`, `tools`) serialized FIRST so `out[..frozen_prefix_len]` is byte-for-byte

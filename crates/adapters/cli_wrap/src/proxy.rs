@@ -1,29 +1,29 @@
-use crate::headers::{apply_proxy_headers, decode_incoming_body, resolve_upstream_url};
-use crate::telemetry_sink::{finalize_turn, prepare_outbound, PendingTurn};
+use crate::headers::{
+    apply_proxy_headers, decode_incoming_body, has_bypass_header, resolve_upstream_url,
+    UpstreamTargets,
+};
+use crate::telemetry_sink::{
+    apply_non_streaming_patch, finalize_turn, prepare_outbound, stream_sse_response, BoxBody,
+};
 use aphelion_core::sse_dialect::extract_usage_from_json;
-use aphelion_core::stream_fsm::StreamFsm;
 use aphelion_core::types::SessionState;
+use aphelion_core::workload::is_passthrough_path;
 use aphelion_telemetry::audit::AuditLedger;
 use aphelion_telemetry::ledger::SessionCostSummary;
 use bytes::Bytes;
-use futures_util::StreamExt;
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use std::convert::Infallible;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
-type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
-
 pub struct ProxyState {
-    pub upstream_openai: String,
-    pub upstream_anthropic: String,
+    pub targets: UpstreamTargets,
     pub client: Client,
     pub session: Mutex<SessionState>,
     pub summary: Mutex<SessionCostSummary>,
@@ -36,9 +36,20 @@ impl ProxyState {
         upstream_anthropic: String,
         audit: Option<Mutex<AuditLedger>>,
     ) -> Self {
+        Self::with_targets(
+            UpstreamTargets {
+                openai: upstream_openai,
+                anthropic: upstream_anthropic,
+                gemini: "https://generativelanguage.googleapis.com".to_owned(),
+                ollama: "http://127.0.0.1:11434".to_owned(),
+            },
+            audit,
+        )
+    }
+
+    pub fn with_targets(targets: UpstreamTargets, audit: Option<Mutex<AuditLedger>>) -> Self {
         Self {
-            upstream_openai,
-            upstream_anthropic,
+            targets,
             client: Client::new(),
             session: Mutex::new(SessionState::default()),
             summary: Mutex::new(SessionCostSummary::default()),
@@ -82,13 +93,17 @@ async fn handle_request(
         Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "failed reading body")),
     };
     let decoded_body = decode_incoming_body(&headers, &raw_bytes);
+    let target_url = resolve_upstream_url(&state.targets, &headers, &path_and_query);
 
-    let target_url =
-        resolve_upstream_url(&state.upstream_openai, &state.upstream_anthropic, &path_and_query);
-    let (outbound_body, pending) = if method == hyper::Method::POST && !decoded_body.is_empty() {
-        prepare_outbound(&state, &decoded_body)
-    } else {
+    let should_bypass = method != hyper::Method::POST
+        || decoded_body.is_empty()
+        || has_bypass_header(&headers)
+        || is_passthrough_path(&path_and_query);
+
+    let (outbound_body, pending) = if should_bypass {
         (decoded_body, None)
+    } else {
+        prepare_outbound(&state, &decoded_body)
     };
 
     let req_method =
@@ -131,87 +146,38 @@ async fn handle_request(
         return Ok(resp);
     }
 
-    if content_type.contains("text/event-stream") {
+    if content_type.contains("text/event-stream") || content_type.contains("application/x-ndjson") {
         return Ok(stream_sse_response(status, content_type, upstream_res, state, pending));
     }
 
-    let bytes = upstream_res.bytes().await.unwrap_or_default();
+    let mut bytes = upstream_res.bytes().await.unwrap_or_default().to_vec();
     if let Some(turn) = pending {
-        let usage = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| extract_usage_from_json(&v));
-        let total_ms = turn.started_at.elapsed().as_millis() as u64;
-        finalize_turn(
-            &state,
-            turn,
-            usage,
-            total_ms,
-            total_ms,
-            String::from_utf8_lossy(&bytes).into_owned(),
-        );
+        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let usage = extract_usage_from_json(&json);
+            if apply_non_streaming_patch(&mut json, &state) {
+                if let Ok(updated) = serde_json::to_vec(&json) {
+                    bytes = updated;
+                }
+            }
+            let total_ms = turn.started_at.elapsed().as_millis() as u64;
+            finalize_turn(
+                &state,
+                turn,
+                usage,
+                total_ms,
+                total_ms,
+                String::from_utf8_lossy(&bytes).into_owned(),
+            );
+        }
     }
+    let len = bytes.len();
     let resp = Response::builder()
         .status(status)
         .header("content-type", content_type)
-        .body(BoxBody::new(Full::new(bytes)))
+        .header("content-length", len.to_string())
+        .body(BoxBody::new(Full::new(Bytes::from(bytes))))
         .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "resp build err"));
     Ok(resp)
-}
-
-fn stream_sse_response(
-    status: StatusCode,
-    content_type: String,
-    upstream_res: reqwest::Response,
-    state: Arc<ProxyState>,
-    pending: Option<PendingTurn>,
-) -> Response<BoxBody> {
-    let fsm = Arc::new(Mutex::new(StreamFsm::default()));
-    let pending_cell = Arc::new(Mutex::new(pending));
-    let ttft_cell = Arc::new(Mutex::new(None::<u64>));
-
-    let byte_stream = upstream_res.bytes_stream().then(move |item| {
-        let state = Arc::clone(&state);
-        let fsm = Arc::clone(&fsm);
-        let pending_cell = Arc::clone(&pending_cell);
-        let ttft_cell = Arc::clone(&ttft_cell);
-        async move {
-            let chunk = item.unwrap_or_default();
-            if let Ok(mut t) = ttft_cell.lock() {
-                if t.is_none() {
-                    if let Ok(p) = pending_cell.lock() {
-                        if let Some(ref turn) = *p {
-                            *t = Some(turn.started_at.elapsed().as_millis() as u64);
-                        }
-                    }
-                }
-            }
-            let processed = if let (Ok(mut f), Ok(mut s)) = (fsm.lock(), state.session.lock()) {
-                aphelion_core::process_sse_chunk(&mut f, &chunk, &mut s)
-            } else {
-                chunk.to_vec()
-            };
-            let is_terminal = processed.windows(6).any(|w| w == b"[DONE]")
-                || processed.windows(12).any(|w| w == b"message_stop");
-            if is_terminal {
-                if let Ok(mut p) = pending_cell.lock() {
-                    if let Some(turn) = p.take() {
-                        let usage = state.session.lock().ok().and_then(|s| s.last_usage.clone());
-                        let total_ms = turn.started_at.elapsed().as_millis() as u64;
-                        let ttft_ms = ttft_cell.lock().ok().and_then(|t| *t).unwrap_or(total_ms);
-                        finalize_turn(&state, turn, usage, ttft_ms, total_ms, String::new());
-                    }
-                }
-            }
-            Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(processed)))
-        }
-    });
-    let boxed: Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>> =
-        Box::pin(byte_stream);
-    Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(BoxBody::new(StreamBody::new(boxed)))
-        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "sse build err"))
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response<BoxBody> {
