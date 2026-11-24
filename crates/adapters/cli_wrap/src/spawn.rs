@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::env;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
