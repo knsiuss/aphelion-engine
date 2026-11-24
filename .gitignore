@@ -1,0 +1,7 @@
+/target/
+**/node_modules/
+*.db
+*.db-journal
+*.db-wal
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+{
+  "name": "@aphelion/middleware",
+  "version": "0.8.0",
+  "description": "In-process LongLived router middleware for Aphelion (9Router, LiteLLM, Node fetch pipelines)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

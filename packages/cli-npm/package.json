@@ -1,0 +1,15 @@
+{
+  "name": "aphelion",
+  "version": "0.8.0",
+  "description": "Zero-daemon Sans-I/O token and inference optimizer launcher for coding agents",
+  "license": "MIT",
+  "bin": {
+    "aphelion": "./bin/aphelion.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "aphelion-vllm-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

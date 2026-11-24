@@ -1,0 +1,223 @@
+use crate::headers::{apply_proxy_headers, decode_incoming_body, resolve_upstream_url};
+use crate::telemetry_sink::{finalize_turn, prepare_outbound, PendingTurn};
+use aphelion_core::sse_dialect::extract_usage_from_json;
+use aphelion_core::stream_fsm::StreamFsm;
+use aphelion_core::types::SessionState;
+use aphelion_telemetry::audit::AuditLedger;
+use aphelion_telemetry::ledger::SessionCostSummary;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use reqwest::Client;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
+
+pub struct ProxyState {
+    pub upstream_openai: String,
+    pub upstream_anthropic: String,
+    pub client: Client,
+    pub session: Mutex<SessionState>,
+    pub summary: Mutex<SessionCostSummary>,
+    pub audit: Option<Mutex<AuditLedger>>,
+}
+
+impl ProxyState {
+    pub fn new(
+        upstream_openai: String,
+        upstream_anthropic: String,
+        audit: Option<Mutex<AuditLedger>>,
+    ) -> Self {
+        Self {
+            upstream_openai,
+            upstream_anthropic,
+            client: Client::new(),
+            session: Mutex::new(SessionState::default()),
+            summary: Mutex::new(SessionCostSummary::default()),
+            audit,
+        }
+    }
+
+    pub fn summary_snapshot(&self) -> SessionCostSummary {
+        self.summary.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+pub async fn run_proxy_server(listener: TcpListener, state: Arc<ProxyState>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let io = TokioIo::new(stream);
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            let service = service_fn(move |req| handle_request(req, Arc::clone(&st)));
+            let _ = http1::Builder::new().serve_connection(io, service).await;
+        });
+    }
+}
+
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<ProxyState>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    let headers = req.headers().clone();
+
+    let raw_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST, "failed reading body")),
+    };
+    let decoded_body = decode_incoming_body(&headers, &raw_bytes);
+
+    let target_url =
+        resolve_upstream_url(&state.upstream_openai, &state.upstream_anthropic, &path_and_query);
+    let (outbound_body, pending) = if method == hyper::Method::POST && !decoded_body.is_empty() {
+        prepare_outbound(&state, &decoded_body)
+    } else {
+        (decoded_body, None)
+    };
+
+    let req_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
+    let body_len = outbound_body.len();
+    let upstream_req = apply_proxy_headers(
+        state.client.request(req_method, &target_url),
+        &headers,
+        body_len,
+    )
+    .body(outbound_body);
+
+    let upstream_res = match upstream_req.send().await {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[aphelion] upstream connection error: {err}");
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream error: {err}"),
+            ));
+        }
+    };
+
+    let status = StatusCode::from_u16(upstream_res.status().as_u16()).unwrap_or(StatusCode::OK);
+    let content_type = upstream_res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+
+    if !status.is_success() {
+        let err_bytes = upstream_res.bytes().await.unwrap_or_default();
+        eprintln!("[aphelion] upstream HTTP {} on {path_and_query}", status.as_u16());
+        let resp = Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .body(BoxBody::new(Full::new(err_bytes)))
+            .unwrap_or_else(|_| error_response(status, "upstream error"));
+        return Ok(resp);
+    }
+
+    if content_type.contains("text/event-stream") {
+        return Ok(stream_sse_response(status, content_type, upstream_res, state, pending));
+    }
+
+    let bytes = upstream_res.bytes().await.unwrap_or_default();
+    if let Some(turn) = pending {
+        let usage = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| extract_usage_from_json(&v));
+        let total_ms = turn.started_at.elapsed().as_millis() as u64;
+        finalize_turn(
+            &state,
+            turn,
+            usage,
+            total_ms,
+            total_ms,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        );
+    }
+    let resp = Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(BoxBody::new(Full::new(bytes)))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "resp build err"));
+    Ok(resp)
+}
+
+fn stream_sse_response(
+    status: StatusCode,
+    content_type: String,
+    upstream_res: reqwest::Response,
+    state: Arc<ProxyState>,
+    pending: Option<PendingTurn>,
+) -> Response<BoxBody> {
+    let fsm = Arc::new(Mutex::new(StreamFsm::default()));
+    let pending_cell = Arc::new(Mutex::new(pending));
+    let ttft_cell = Arc::new(Mutex::new(None::<u64>));
+
+    let byte_stream = upstream_res.bytes_stream().then(move |item| {
+        let state = Arc::clone(&state);
+        let fsm = Arc::clone(&fsm);
+        let pending_cell = Arc::clone(&pending_cell);
+        let ttft_cell = Arc::clone(&ttft_cell);
+        async move {
+            let chunk = item.unwrap_or_default();
+            if let Ok(mut t) = ttft_cell.lock() {
+                if t.is_none() {
+                    if let Ok(p) = pending_cell.lock() {
+                        if let Some(ref turn) = *p {
+                            *t = Some(turn.started_at.elapsed().as_millis() as u64);
+                        }
+                    }
+                }
+            }
+            let processed = if let (Ok(mut f), Ok(mut s)) = (fsm.lock(), state.session.lock()) {
+                aphelion_core::process_sse_chunk(&mut f, &chunk, &mut s)
+            } else {
+                chunk.to_vec()
+            };
+            let is_terminal = processed.windows(6).any(|w| w == b"[DONE]")
+                || processed.windows(12).any(|w| w == b"message_stop");
+            if is_terminal {
+                if let Ok(mut p) = pending_cell.lock() {
+                    if let Some(turn) = p.take() {
+                        let usage = state.session.lock().ok().and_then(|s| s.last_usage.clone());
+                        let total_ms = turn.started_at.elapsed().as_millis() as u64;
+                        let ttft_ms = ttft_cell.lock().ok().and_then(|t| *t).unwrap_or(total_ms);
+                        finalize_turn(&state, turn, usage, ttft_ms, total_ms, String::new());
+                    }
+                }
+            }
+            Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(processed)))
+        }
+    });
+    let boxed: Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>> =
+        Box::pin(byte_stream);
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(BoxBody::new(StreamBody::new(boxed)))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "sse build err"))
+}
+
+fn error_response(status: StatusCode, msg: &str) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(BoxBody::new(Full::new(Bytes::from(msg.to_owned()))))
+        .expect("static response builder")
+}

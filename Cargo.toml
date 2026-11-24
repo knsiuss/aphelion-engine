@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/telemetry",
+    "crates/distill",
+    "crates/adapters/cli_wrap",
+    "crates/adapters/ffi_wasm",
+    "bench/harness",
+    "bench/vllm_probe",
+]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2021"
+license = "MIT"

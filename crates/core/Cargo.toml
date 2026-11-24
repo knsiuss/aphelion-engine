@@ -1,0 +1,43 @@
+[package]
+name = "aphelion-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+slm-onnx = []
+
+[dependencies]
+base64 = "0.22"
+fontdue = "0.9"
+png = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+tree-sitter = "0.24"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[[test]]
+name = "fuzz_sse"
+path = "../../tests/fuzz_sse.rs"
+
+[[test]]
+name = "fuzz_dialects"
+path = "../../tests/fuzz_dialects.rs"
+
+[[test]]
+name = "api_contracts"
+path = "../../tests/api_contracts.rs"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "core_latency"
+path = "../../benches/core_latency.rs"
+harness = false
