@@ -78,10 +78,7 @@ pub fn is_structured_output(root: &Value) -> bool {
             return true;
         }
     }
-    if root.get("format").and_then(Value::as_str) == Some("json") {
-        return true;
-    }
-    false
+    root.get("format").and_then(Value::as_str) == Some("json")
 }
 
 /// Returns true if the request path is a non-inference endpoint that must pass through untouched.
