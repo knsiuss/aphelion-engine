@@ -55,5 +55,13 @@ name = "claude_code_cache_v34"
 path = "../../../tests/claude_code_cache_v34.rs"
 
 [[test]]
+name = "smart_routing_v35"
+path = "../../../tests/smart_routing_v35.rs"
+
+[[test]]
+name = "rtk_and_combo_v36"
+path = "../../../tests/rtk_and_combo_v36.rs"
+
+[[test]]
 name = "audit_remediation_v33"
 path = "../../../tests/audit_remediation_v33.rs"

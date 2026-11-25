@@ -92,6 +92,7 @@ pub fn parse_request_options(
         compaction_threshold_tokens: Some(comp_thresh),
         locked_tail_messages: Some(tail_keep),
         slm_endpoint: Some(slm_ep),
+        routing: Default::default(),
     }
 }
 

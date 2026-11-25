@@ -1,6 +1,10 @@
+use crate::account_vault::AccountVault;
+use crate::combo_pool::ComboPool;
 use crate::config::GatewayConfig;
+use crate::failover::{dispatch_with_failover, CooldownTracker};
+use crate::quota_tracker::QuotaTracker;
 use crate::headers::{
-    apply_proxy_headers, decode_incoming_body_bounded, has_bypass_header, parse_request_options,
+    decode_incoming_body_bounded, extract_model, has_bypass_header, parse_request_options,
     UpstreamTargets,
 };
 use crate::provider_registry::{DEFAULT_GEMINI_BASE, DEFAULT_OLLAMA_BASE};
@@ -45,6 +49,10 @@ pub struct ProxyState {
     pub summary: Mutex<SessionCostSummary>,
     pub audit: Option<Mutex<AuditLedger>>,
     pub policy: RwLock<RuntimePolicy>,
+    pub accounts: AccountVault,
+    pub quotas: QuotaTracker,
+    pub combos: ComboPool,
+    pub failover: CooldownTracker,
     pub topology: Mutex<TopologyTracker>,
     pub events_tx: broadcast::Sender<TelemetryEvent>,
     pub started_at: Instant,
@@ -63,30 +71,16 @@ impl ProxyState {
     pub fn with_targets(targets: UpstreamTargets, audit: Option<Mutex<AuditLedger>>) -> Self {
         Self::with_config(targets, PublicConfig::default(), audit)
     }
-    pub fn with_config(
-        targets: UpstreamTargets,
-        public_cfg: PublicConfig,
-        audit: Option<Mutex<AuditLedger>>,
-    ) -> Self {
+    pub fn with_config(targets: UpstreamTargets, public_cfg: PublicConfig, audit: Option<Mutex<AuditLedger>>) -> Self {
         let (events_tx, _) = broadcast::channel(GatewayConfig::env_events_cap());
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let client = Client::builder().redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15)).build().unwrap_or_else(|_| Client::new());
         Self {
-            targets,
-            public_cfg,
-            limiter: SlidingWindowLimiter::default(),
-            metrics: MetricsRegistry::default(),
-            client,
-            session: Mutex::new(SessionState::default()),
-            summary: Mutex::new(SessionCostSummary::default()),
-            audit,
-            policy: RwLock::new(RuntimePolicy::default()),
-            topology: Mutex::new(TopologyTracker::default()),
-            events_tx,
-            started_at: Instant::now(),
+            targets, public_cfg, limiter: SlidingWindowLimiter::default(), metrics: MetricsRegistry::default(),
+            client, session: Mutex::new(SessionState::default()), summary: Mutex::new(SessionCostSummary::default()),
+            audit, policy: RwLock::new(RuntimePolicy::default()), accounts: AccountVault::default(),
+            quotas: QuotaTracker::default(), combos: ComboPool::default(), failover: CooldownTracker::default(),
+            topology: Mutex::new(TopologyTracker::default()), events_tx, started_at: Instant::now(),
         }
     }
     pub fn summary_snapshot(&self) -> SessionCostSummary {
@@ -165,24 +159,39 @@ async fn handle_request(
         || is_passthrough_path(&path_and_query);
 
     let mut req_opts = parse_request_options(&headers, tenant_hash, &route.provider_id);
-    if let Ok(pol) = state.policy.read() {
+    let fallbacks = if let Ok(pol) = state.policy.read() {
         pol.apply_to_request(&mut req_opts, &headers);
-    }
+        pol.fallback_models.clone()
+    } else {
+        Vec::new()
+    };
     let client_tag = detect_client_tag(&headers);
-    let (outbound_body, pending) = if should_bypass {
+    let (outbound_body, mut pending) = if should_bypass {
         (decoded_body, None)
     } else {
         prepare_outbound(&state, &decoded_body, req_opts, &route.provider_id, &client_tag)
     };
 
     let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
-    let body_len = outbound_body.len();
-    let upstream_req = apply_proxy_headers(state.client.request(req_method, &route.target_url), &headers, body_len).body(outbound_body);
-
-    let Ok(upstream_res) = upstream_req.send().await else {
+    let slots = if should_bypass {
+        Vec::new()
+    } else {
+        let sid = pending.as_ref().map(|p| p.session_id.as_str());
+        let escalate = pending.as_ref().is_some_and(|p| p.escalate_to_frontier);
+        state.combos.resolve_slots_with_vault(
+            &extract_model(&outbound_body), &fallbacks, sid, escalate, Some(&state.accounts), Some(&state.quotas),
+        )
+    };
+    let Some(disp) = dispatch_with_failover(
+        &state.client, req_method, &route.target_url, &path_and_query, &headers, outbound_body, &slots, &state.failover, &state.quotas,
+    ).await else {
         eprintln!("[aphelion] upstream connection error on {}", redact_path_query(&path_and_query));
         return Ok(static_resp(StatusCode::BAD_GATEWAY, "text/plain", "upstream connection failed".to_owned()));
     };
+    let (upstream_res, bridged) = (disp.response, disp.bridged_oai_to_anthropic);
+    if let Some(ref mut turn) = pending {
+        if !disp.model.is_empty() { turn.model = disp.model.clone(); }
+    }
 
     let status = StatusCode::from_u16(upstream_res.status().as_u16()).unwrap_or(StatusCode::OK);
     let upstream_headers = upstream_res.headers().clone();
@@ -201,10 +210,16 @@ async fn handle_request(
     }
 
     if content_type.contains("text/event-stream") || content_type.contains("application/x-ndjson") {
-        return Ok(stream_sse_response(status, content_type, upstream_res, state, pending));
+        return Ok(stream_sse_response(status, content_type, upstream_res, state, pending, bridged));
     }
 
     let mut bytes = upstream_res.bytes().await.unwrap_or_default().to_vec();
+    if bridged {
+        let fallback_m = pending.as_ref().map(|p| p.model.as_str()).unwrap_or_default();
+        if let Ok(anth) = aphelion_core::dialect_bridge::translate_openai_to_anthropic_response(&bytes, fallback_m) {
+            bytes = anth;
+        }
+    }
     if let Some(turn) = pending {
         if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             let usage = extract_usage_from_json(&json);

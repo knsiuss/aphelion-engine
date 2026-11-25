@@ -8,14 +8,52 @@ pub struct RuntimePolicy {
     pub output_mode: String,
     pub compaction_mode: String,
     pub reasoning_effort: String,
+    pub route_mode: String,
+    pub fast_model: Option<String>,
+    pub fallback_models: Vec<String>,
+    pub auto_reasoning: String,
 }
 
 impl Default for RuntimePolicy {
     fn default() -> Self {
+        let fast_model = std::env::var("APHELION_FAST_MODEL")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let route_mode = std::env::var("APHELION_ROUTE_MODE")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "off" | "safe" | "aggressive"))
+            .unwrap_or_else(|| {
+                if fast_model.is_some() {
+                    "safe".to_owned()
+                } else {
+                    "off".to_owned()
+                }
+            });
+        let fallback_models = std::env::var("APHELION_FALLBACK_MODELS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let auto_reasoning = std::env::var("APHELION_AUTO_REASONING")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "off" | "safe"))
+            .unwrap_or_else(|| "off".to_owned());
         Self {
             output_mode: "concise".to_owned(),
             compaction_mode: "auto".to_owned(),
             reasoning_effort: "default".to_owned(),
+            route_mode,
+            fast_model,
+            fallback_models,
+            auto_reasoning,
         }
     }
 }
@@ -25,6 +63,10 @@ pub struct PolicyPatch {
     pub output_mode: Option<String>,
     pub compaction_mode: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub route_mode: Option<String>,
+    pub fast_model: Option<String>,
+    pub fallback_models: Option<Vec<String>>,
+    pub auto_reasoning: Option<String>,
 }
 
 impl RuntimePolicy {
@@ -44,6 +86,27 @@ impl RuntimePolicy {
                 self.reasoning_effort = r;
             }
         }
+        if let Some(rm) = patch.route_mode {
+            if matches!(rm.as_str(), "off" | "safe" | "aggressive") {
+                self.route_mode = rm;
+            }
+        }
+        if let Some(fm) = patch.fast_model {
+            let trimmed = fm.trim().to_owned();
+            self.fast_model = (!trimmed.is_empty()).then_some(trimmed);
+        }
+        if let Some(fbs) = patch.fallback_models {
+            self.fallback_models = fbs
+                .into_iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(ar) = patch.auto_reasoning {
+            if matches!(ar.as_str(), "off" | "safe") {
+                self.auto_reasoning = ar;
+            }
+        }
     }
 
     /// Merges gateway-wide runtime policy into per-request `RequestOptions`.
@@ -57,6 +120,12 @@ impl RuntimePolicy {
         if opts.reasoning_effort.is_none() && self.reasoning_effort != "default" {
             opts.reasoning_effort = Some(self.reasoning_effort.clone());
         }
+        opts.routing.route_mode = self.route_mode.clone();
+        opts.routing.fast_model = self.fast_model.clone();
+        opts.routing.fast_max_context_tokens = std::env::var("APHELION_FAST_MAX_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        opts.routing.auto_reasoning_safe = self.auto_reasoning == "safe";
     }
 }
 

@@ -100,10 +100,17 @@ pub fn inject_concise_output_directive(ir: &mut NormalizedRequest, opts: &Reques
     }
 }
 
-/// Maps optional `X-Aphelion-Reasoning-Effort: low | medium | high` to provider-native fields.
+/// Maps optional `X-Aphelion-Reasoning-Effort: low | medium | high` (or opt-in
+/// `APHELION_AUTO_REASONING=safe` on deterministic mechanical turns) to provider-native fields.
 pub fn apply_reasoning_budget(ir: &mut NormalizedRequest, opts: &RequestOptions) {
-    let Some(effort_raw) = opts.reasoning_effort.as_deref() else {
-        return;
+    let effort_raw = match opts.reasoning_effort.as_deref() {
+        Some(explicit) => explicit,
+        None if opts.routing.auto_reasoning_safe
+            && crate::tier_router::is_safe_low_reasoning_turn(ir) =>
+        {
+            "low"
+        }
+        None => return,
     };
     let effort = match effort_raw.trim().to_ascii_lowercase().as_str() {
         "low" => "low",

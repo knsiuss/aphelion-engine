@@ -25,6 +25,8 @@ pub struct PendingTurn {
     pub circuit_breaker_tripped: bool,
     pub compaction_triggered: bool,
     pub compaction_tokens_reclaimed: usize,
+    pub ingress_saved_tokens: usize,
+    pub escalate_to_frontier: bool,
     pub started_at: Instant,
 }
 
@@ -85,13 +87,13 @@ pub fn prepare_outbound(
         raw_tokens: raw_tok,
         opt_tokens: opt_tok,
         fallback_cache_read: fallback_cache,
-        slm_routed: matches!(
-            transformed.metrics.slm_route,
-            SlmRouteDecision::CompiledSlm { .. }
-        ),
+        slm_routed: st.routed_fast_model.is_some()
+            || matches!(transformed.metrics.slm_route, SlmRouteDecision::CompiledSlm { .. }),
         circuit_breaker_tripped: st.circuit_breaker_tripped,
         compaction_triggered: st.macro_compaction_triggered,
         compaction_tokens_reclaimed: st.compaction_tokens_reclaimed,
+        ingress_saved_tokens: st.ingress_saved_tokens,
+        escalate_to_frontier: transformed.metrics.complexity_deep || st.circuit_breaker_tripped,
         started_at: Instant::now(),
     };
     (transformed.body, Some(pending))
@@ -168,23 +170,13 @@ pub fn finalize_turn(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let ingress_saved = turn.raw_tokens.saturating_sub(turn.opt_tokens);
+    let ingress_saved = turn.ingress_saved_tokens.max(turn.raw_tokens.saturating_sub(turn.opt_tokens));
     let net_saved_usd = compute_turn_net_saved_usd(
-        turn.turn_index,
-        turn.raw_tokens,
-        turn.opt_tokens,
-        uncached,
-        cache_read,
-        u.cache_creation_tokens,
-        u.output_tokens,
-        c_eff,
+        turn.turn_index, turn.raw_tokens, turn.opt_tokens, uncached, cache_read,
+        u.cache_creation_tokens, u.output_tokens, c_eff,
     );
     let denom = cache_read + uncached + u.cache_creation_tokens;
-    let cache_hit_pct = if denom == 0 {
-        0.0
-    } else {
-        (cache_read as f64 * 100.0) / (denom as f64)
-    };
+    let cache_hit_pct = if denom == 0 { 0.0 } else { (cache_read as f64 * 100.0) / (denom as f64) };
     let mut badges = Vec::new();
     if turn.compaction_triggered {
         badges.push("COMPACTED".to_owned());

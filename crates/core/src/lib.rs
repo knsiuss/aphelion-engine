@@ -7,19 +7,25 @@ pub mod composer;
 pub mod compressor;
 pub mod compressor_rules;
 pub mod defaults;
+pub mod dialect_bridge;
 pub mod diet_gc;
 pub mod economizer;
 pub mod economizer_rules;
 pub mod flight_recorder;
 pub mod ingress_anthropic;
 pub mod ingress_opt;
+pub mod ingress_trim;
 pub mod normalizer;
 pub mod optical_history;
 pub mod output_opt;
 pub mod patcher;
 pub mod prefix_ledger;
+pub mod rtk_chain;
+pub mod rtk_filters;
+pub mod sse_bridge;
 pub mod sse_dialect;
 pub mod stream_fsm;
+pub mod tier_router;
 pub mod tron_codec;
 pub mod types;
 pub mod usage_extract;
@@ -64,8 +70,9 @@ pub fn prepare_request_with_flags(
         return composer::compose_outbound(ir, state, flags);
     }
 
-    // Phase 2: Turn-0 Pre-Freeze Output Steering & Reasoning Budget (BEFORE prefix lock!).
+    // Phase 2: Turn-0 Pre-Freeze Output Steering, Cache-Aware Tier Routing & Reasoning Budget.
     let opts = state.request_options.clone();
+    tier_router::apply_tier_routing(&mut ir, &opts, state.turn_index);
     output_opt::inject_concise_output_directive(&mut ir, &opts);
     output_opt::apply_reasoning_budget(&mut ir, &opts);
 

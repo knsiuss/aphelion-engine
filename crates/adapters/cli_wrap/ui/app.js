@@ -152,6 +152,81 @@
     pulseTopo(ev.client, ev.provider);
   });
 
+  async function refreshAccountsAndCombos() {
+    const [ac, cb, ig] = await Promise.all([
+      fetch("/api/accounts" + tokQuery).then(r => r.json()).catch(() => null),
+      fetch("/api/combos" + tokQuery).then(r => r.json()).catch(() => null),
+      fetch("/api/integrations" + tokQuery).then(r => r.json()).catch(() => null),
+    ]);
+    if (ig && $("ide-activator-box")) {
+      $("ide-activator-box").innerHTML = (ig.integrations || []).map(item => `
+        <div class="feed-row mono" style="display:flex;justify-content:space-between;align-items:center;padding:10px 4px">
+          <div>
+            <strong>${esc(item.name)}</strong>
+            <span class="${item.active ? "green" : "amber"}" style="margin-left:8px">[${item.active ? "ACTIVE" : "INACTIVE"}]</span>
+            <div class="muted" style="font-size:12px">${esc(item.config_path)} | current: ${esc(item.current_url || "(default)")}</div>
+          </div>
+          <button class="copy-btn" data-ide-id="${esc(item.id)}" data-ide-act="${item.active ? "deactivate" : "activate"}">
+            ${item.active ? "Deactivate & Restore" : "Activate Aphelion"}
+          </button>
+        </div>`).join("") || '<div class="empty">No supported IDEs detected</div>';
+      document.querySelectorAll("[data-ide-id]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          await fetch("/api/integrations" + tokQuery, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ id: btn.dataset.ideId, action: btn.dataset.ideAct, proxy_base: location.origin }),
+          });
+          refreshAccountsAndCombos();
+        });
+      });
+    }
+    if (ac && $("ac-tbody")) {
+      $("ac-tbody").innerHTML = (ac.accounts || []).map(({ account: a, quota: q }) => `<tr class="mono">
+        <td>${esc(a.id)}</td><td>${esc(a.provider)}</td><td>${esc(a.dialect)}</td><td>${esc(a.tier)}</td>
+        <td>${esc(a.secret_masked || "—")}</td><td class="${q.status === "healthy" ? "green" : "amber"}">${esc(q.status)}</td>
+        <td class="num">${Number(q.requests_today || 0)}</td>
+        <td class="num"><button class="copy-btn" data-del-acct="${esc(a.id)}">Remove</button></td>
+      </tr>`).join("") || '<tr><td colspan="8" class="empty">No accounts configured</td></tr>';
+      document.querySelectorAll("[data-del-acct]").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          await fetch("/api/accounts/" + encodeURIComponent(btn.dataset.delAcct) + tokQuery, { method: "DELETE" });
+          refreshAccountsAndCombos();
+        });
+      });
+    }
+    if (cb && $("cb-json") && document.activeElement !== $("cb-json")) {
+      $("cb-json").value = JSON.stringify(cb, null, 2);
+    }
+  }
+  if ($("ac-save")) {
+    $("ac-save").addEventListener("click", async () => {
+      await fetch("/api/accounts" + tokQuery, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: $("ac-id").value.trim(), provider: $("ac-provider").value.trim() || "custom",
+          base_url: $("ac-url").value.trim(), secret: $("ac-key").value.trim(),
+          dialect: $("ac-dialect").value, tier: $("ac-tier").value, enabled: true,
+        }),
+      });
+      $("ac-key").value = "";
+      refreshAccountsAndCombos();
+    });
+  }
+  if ($("cb-save")) {
+    $("cb-save").addEventListener("click", async () => {
+      try {
+        const parsed = JSON.parse($("cb-json").value);
+        await fetch("/api/combos" + tokQuery, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(parsed),
+        });
+        $("cb-save").textContent = "Saved!";
+        setTimeout(() => ($("cb-save").textContent = "Save Combos"), 1200);
+      } catch { alert("Invalid JSON"); }
+    });
+  }
+
   refresh();
+  refreshAccountsAndCombos();
   setInterval(refresh, 5000);
 })();

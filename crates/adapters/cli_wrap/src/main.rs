@@ -1,4 +1,5 @@
 use aphelion_cli::audit_report::run_audit_summary_cmd;
+use aphelion_cli::auth_cli::{run_auth_cmd, run_init_cmd};
 use aphelion_cli::cli_audit::{print_summary, print_usage, run_audit_export};
 use aphelion_cli::cli_commands::{run_doctor, run_ui_open};
 use aphelion_cli::config::{GatewayConfig, DEFAULT_GATEWAY_PORT};
@@ -22,6 +23,8 @@ async fn main() -> ExitCode {
             run_doctor();
             return ExitCode::SUCCESS;
         }
+        Some("init") => return run_init_cmd(),
+        Some("auth") => return run_auth_cmd(&args[1..]),
         Some("ui") => return run_ui_open(&args[1..]),
         Some("top") => return run_top(&args[1..], &db_path).await,
         Some("--audit-summary") => return run_audit_summary_cmd(&db_path, &args[1..]),
@@ -101,9 +104,9 @@ async fn run_gateway_mode(args: &[String]) -> ExitCode {
     };
 
     let mode_tag = if cfg.public { "public" } else { "local" };
-    eprintln!("[aphelion v3.2] listening on http://{local_addr} (mode={mode_tag}) -> {primary}");
+    eprintln!("[aphelion v3.8] listening on http://{local_addr} (mode={mode_tag}) -> {primary}");
     if !cfg.public {
-        eprintln!("[aphelion v3.2] local dashboard: http://{local_addr}/ui");
+        eprintln!("[aphelion v3.8] local dashboard: http://{local_addr}/ui");
     }
 
     let state = Arc::new(ProxyState::with_config(

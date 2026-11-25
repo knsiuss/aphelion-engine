@@ -2,6 +2,7 @@ use crate::proxy::ProxyState;
 use crate::public_guard::GuardRejection;
 use crate::telemetry_sink::{finalize_turn, BoxBody, PendingTurn};
 use aphelion_core::patcher::reconstruct_from_patch;
+use aphelion_core::sse_bridge::OpenAiToAnthropicSseBridge;
 use aphelion_core::stream_fsm::StreamFsm;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -86,16 +87,20 @@ pub fn stream_sse_response(
     upstream_res: reqwest::Response,
     state: Arc<ProxyState>,
     pending: Option<PendingTurn>,
+    bridge_oai_to_anthropic: bool,
 ) -> Response<BoxBody> {
     let fsm = Arc::new(Mutex::new(StreamFsm::default()));
+    let bridge_model = pending.as_ref().map(|p| p.model.clone()).unwrap_or_default();
+    let bridge = bridge_oai_to_anthropic.then(|| Arc::new(Mutex::new(OpenAiToAnthropicSseBridge::new(bridge_model))));
     let pending_cell = Arc::new(Mutex::new(pending));
     let ttft_cell = Arc::new(Mutex::new(None::<u64>));
 
     let upstream_headers = upstream_res.headers().clone();
     let byte_stream = upstream_res.bytes_stream().then(move |item| {
-        let (state, fsm, pending_cell, ttft_cell) = (
+        let (state, fsm, bridge, pending_cell, ttft_cell) = (
             Arc::clone(&state),
             Arc::clone(&fsm),
+            bridge.clone(),
             Arc::clone(&pending_cell),
             Arc::clone(&ttft_cell),
         );
@@ -127,10 +132,15 @@ pub fn stream_sse_response(
                     }
                 }
             }
-            let processed = if let (Ok(mut f), Ok(mut s)) = (fsm.lock(), state.session.lock()) {
-                aphelion_core::process_sse_chunk(&mut f, &chunk, &mut s)
+            let bridged: Vec<u8> = if let Some(ref br) = bridge {
+                br.lock().map(|mut b| b.push_chunk(&chunk)).unwrap_or_else(|_| chunk.to_vec())
             } else {
                 chunk.to_vec()
+            };
+            let processed = if let (Ok(mut f), Ok(mut s)) = (fsm.lock(), state.session.lock()) {
+                aphelion_core::process_sse_chunk(&mut f, &bridged, &mut s)
+            } else {
+                bridged
             };
             let is_terminal = processed.windows(6).any(|w| w == b"[DONE]")
                 || processed.windows(12).any(|w| w == b"message_stop")

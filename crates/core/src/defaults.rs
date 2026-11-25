@@ -15,3 +15,7 @@ pub const DEFAULT_MAX_LEDGER_SESSIONS: usize = 512;
 pub const DEFAULT_SLM_ENDPOINT: &str = "http://127.0.0.1:8081/v1";
 /// Default consecutive block repetitions before SSE loop breaker terminates runaway output.
 pub const DEFAULT_SSE_LOOP_MIN_REPS: usize = 3;
+/// Max BPE context tokens eligible for cache-aware `Tier::Fast` routing (protects warm >12k caches).
+pub const DEFAULT_FAST_MAX_CONTEXT_TOKENS: usize = 12_000;
+/// Default cooldown duration (seconds) after upstream HTTP 429 / 502 / 503 failover.
+pub const DEFAULT_FAILOVER_COOLDOWN_SECS: u64 = 60;

@@ -1,7 +1,9 @@
+use crate::combo_pool::ComboConfig;
 use crate::proxy::ProxyState;
 use crate::public_guard::PublicConfig;
 use crate::sse_stream::static_resp;
 use crate::telemetry_sink::BoxBody;
+use crate::ui_accounts_api::{handle_accounts_api, is_accounts_api_path};
 use crate::ui_queries::{build_overview_json, build_topology_json};
 use crate::ui_state::PolicyPatch;
 use bytes::Bytes;
@@ -25,9 +27,10 @@ pub fn is_ui_or_api_path(path_and_query: &str) -> bool {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     path == "/ui"
         || path.starts_with("/ui/")
+        || is_accounts_api_path(path)
         || matches!(
             path,
-            "/api/overview" | "/api/topology" | "/api/events" | "/api/policy"
+            "/api/overview" | "/api/topology" | "/api/events" | "/api/policy" | "/api/combos"
         )
 }
 
@@ -124,6 +127,12 @@ pub fn handle_ui_or_api(
         }
         (&Method::GET, "/api/events") => stream_events_sse(state),
         (&Method::POST, "/api/policy") => handle_policy_update(headers, body, &state),
+        (&Method::GET, "/api/combos") => {
+            let json_str = serde_json::to_string(&state.combos.snapshot()).unwrap_or_else(|_| "{}".to_owned());
+            static_resp(StatusCode::OK, "application/json", json_str)
+        }
+        (&Method::POST, "/api/combos") => handle_combos_update(headers, body, &state),
+        (_, p) if is_accounts_api_path(p) => handle_accounts_api(method, p, headers, body, &state),
         _ => static_resp(
             StatusCode::NOT_FOUND,
             "application/json",
@@ -156,6 +165,20 @@ fn handle_policy_update(headers: &HeaderMap, body: &[u8], state: &ProxyState) ->
         Default::default()
     };
     let json_str = serde_json::to_string(&updated).unwrap_or_else(|_| "{}".to_owned());
+    static_resp(StatusCode::OK, "application/json", json_str)
+}
+
+fn handle_combos_update(headers: &HeaderMap, body: &[u8], state: &ProxyState) -> Response<BoxBody> {
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !origin.contains("127.0.0.1") && !origin.contains("localhost") && !state.public_cfg.public_mode {
+            return static_resp(StatusCode::FORBIDDEN, "application/json", r#"{"error":"forbidden"}"#.to_owned());
+        }
+    }
+    let Ok(cfg) = serde_json::from_slice::<ComboConfig>(body) else {
+        return static_resp(StatusCode::BAD_REQUEST, "application/json", r#"{"error":"invalid combos json"}"#.to_owned());
+    };
+    state.combos.replace(cfg);
+    let json_str = serde_json::to_string(&state.combos.snapshot()).unwrap_or_else(|_| "{}".to_owned());
     static_resp(StatusCode::OK, "application/json", json_str)
 }
 

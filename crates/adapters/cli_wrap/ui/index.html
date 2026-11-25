@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Aphelion v3.2 — Live Telemetry &amp; Routing</title>
+  <title>Aphelion v3.8 — Standalone AI Gateway &amp; Token Engine</title>
   <link rel="stylesheet" href="/ui/styles.css" />
 </head>
 <body>
@@ -11,10 +11,12 @@
     <div class="brand">
       <span class="logo-dot"></span>
       <strong>APHELION</strong>
-      <span class="ver">v3.2</span>
+      <span class="ver">v3.8</span>
     </div>
     <nav class="tabs" id="nav-tabs">
       <button class="tab active" data-tab="topology">Topology</button>
+      <button class="tab" data-tab="accounts">Accounts</button>
+      <button class="tab" data-tab="combos">Combos</button>
       <button class="tab" data-tab="analytics">Analytics</button>
       <button class="tab" data-tab="providers">Providers</button>
       <button class="tab" data-tab="connect">Quick Connect</button>
@@ -113,7 +115,42 @@
       </div>
     </section>
 
+    <section class="panel" id="tab-accounts">
+      <div class="card">
+        <div class="card-head"><h2>Add / Update Provider Account</h2><span class="muted">Stored locally in ~/.aphelion/accounts.json</span></div>
+        <div class="policy-bar" style="flex-wrap:wrap;gap:8px;padding:12px 0">
+          <input id="ac-id" class="search" placeholder="id (e.g. deepseek-main)" />
+          <input id="ac-provider" class="search" placeholder="provider (deepseek/openai/anthropic)" />
+          <input id="ac-url" class="search" placeholder="base_url (https://api.deepseek.com)" />
+          <input id="ac-key" class="search" type="password" placeholder="API key / OAuth token" />
+          <select id="ac-dialect"><option value="openai">openai (bridged)</option><option value="anthropic">anthropic</option></select>
+          <select id="ac-tier"><option value="cheap">cheap</option><option value="free">free</option><option value="subscription">subscription</option><option value="paid">paid</option></select>
+          <button class="copy-btn" id="ac-save">Save Account</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>Provider</th><th>Dialect</th><th>Tier</th><th>Key</th><th>Status</th><th class="num">Req</th><th class="num">Action</th></tr></thead>
+            <tbody id="ac-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-combos">
+      <div class="card">
+        <div class="card-head"><h2>Smart Combos (JSON)</h2><button class="copy-btn" id="cb-save">Save Combos</button></div>
+        <textarea id="cb-json" class="snippet mono" style="width:100%;min-height:220px;box-sizing:border-box"></textarea>
+      </div>
+    </section>
+
     <section class="panel" id="tab-connect">
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head">
+          <h2>1-Click IDE Activation (GUI &amp; CLI — No Wrapper Command Needed)</h2>
+          <span class="muted">Auto-backups existing settings before switching</span>
+        </div>
+        <div id="ide-activator-box">Loading integrations...</div>
+      </div>
       <div class="connect-grid" id="connect-grid"></div>
     </section>
   </main>

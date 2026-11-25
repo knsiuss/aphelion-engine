@@ -76,9 +76,17 @@ pub fn compose_outbound(
         && validator::validate_outbound_messages(ir.dialect, &ir.root).is_err()
     {
         if let Some(original_msgs) = ir.pre_compaction_messages.take() {
-            ir.root["messages"] = original_msgs;
-            ir.stage_stats.validator_rollback = true;
-            ir.assistant_prefill = None;
+            let orig_valid = validator::validate_outbound_messages(
+                ir.dialect,
+                &json!({ "messages": &original_msgs }),
+            )
+            .is_ok();
+            if orig_valid {
+                ir.root["messages"] = original_msgs;
+                ir.stage_stats.validator_rollback = true;
+                ir.stage_stats.ingress_saved_tokens = 0;
+                ir.assistant_prefill = None;
+            }
         }
     }
 

@@ -1,13 +1,14 @@
 use crate::prefix_ledger::{LedgerKey, PrefixLedger};
+use crate::tier_router::TierRoutingConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecutionProfile {
-    Ephemeral,
-    LongLived,
-}
+pub enum ExecutionProfile { Ephemeral, LongLived }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Complexity { Trivial, Deep }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dialect {
@@ -26,12 +27,6 @@ pub enum WorkloadClass {
     SingleTurnRagOrChat,
     StructuredOutput,
     Passthrough,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Complexity {
-    Trivial,
-    Deep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +56,7 @@ pub struct RequestOptions {
     pub compaction_threshold_tokens: Option<usize>,
     pub locked_tail_messages: Option<usize>,
     pub slm_endpoint: Option<String>,
+    pub routing: TierRoutingConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +130,7 @@ pub struct StageStats {
     pub micro_skill_injected: Option<String>,
     pub blocks_anchored: usize,
     pub validator_rollback: bool,
+    pub routed_fast_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

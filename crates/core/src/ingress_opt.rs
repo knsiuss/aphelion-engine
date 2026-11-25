@@ -2,7 +2,9 @@ use crate::diet_gc::estimate_calibrated_tokens;
 use crate::ingress_anthropic::{
     build_tool_use_map, optimize_anthropic_tool_results_ingress, seed_frozen_file_hashes,
 };
+use crate::ingress_trim::{strip_ansi_and_spinners, summarize_passing_test_output};
 use crate::prefix_ledger::FrozenSessionRecord;
+use crate::rtk_filters::apply_rtk_filter;
 use crate::tron_codec::try_encode_tron_table;
 use crate::types::{ExecutionProfile, NormalizedRequest, StageStats};
 use serde_json::Value;
@@ -121,11 +123,16 @@ pub(crate) fn is_read_tool(tool_name: &str) -> bool {
 fn is_log_tool(tool_name: &str) -> bool {
     let lower = tool_name.to_ascii_lowercase();
     lower == "bash"
+        || lower == "grep"
+        || lower == "glob"
+        || lower == "ls"
         || lower.contains("shell")
         || lower.contains("exec")
         || lower.contains("test")
         || lower.contains("log")
         || lower.contains("terminal")
+        || lower.contains("search")
+        || lower.contains("find")
 }
 
 pub(crate) fn optimize_tool_payload(
@@ -168,7 +175,10 @@ pub(crate) fn optimize_tool_payload(
     }
 
     if is_log_tool(tool_name) || !is_source_code_payload(raw) {
-        let deduped = collapse_repetitive_log_lines(raw);
+        let cleaned = strip_ansi_and_spinners(raw);
+        let rtk = apply_rtk_filter(tool_name, hint_path, &cleaned).unwrap_or(cleaned);
+        let condensed = summarize_passing_test_output(&rtk).unwrap_or(rtk);
+        let deduped = collapse_repetitive_log_lines(&condensed);
         let after = estimate_calibrated_tokens(&deduped);
         if after < before {
             return Some((deduped, before - after, false));
