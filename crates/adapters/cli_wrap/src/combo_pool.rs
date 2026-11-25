@@ -50,19 +50,12 @@ pub struct ResolvedSlot {
 
 pub fn default_combos_path() -> PathBuf {
     if let Ok(p) = std::env::var("APHELION_COMBOS_FILE") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p);
-        }
+        if !p.trim().is_empty() { return PathBuf::from(p); }
     }
     let home_path = default_aphelion_dir().join("combos.json");
-    if home_path.exists() {
-        return home_path;
-    }
+    if home_path.exists() { return home_path; }
     let local = PathBuf::from("aphelion_combos.json");
-    if local.exists() {
-        return local;
-    }
-    home_path
+    if local.exists() { local } else { home_path }
 }
 
 /// Thread-safe Combo & Multi-Account/Key Pool (zero hardcoded models or secrets).
@@ -98,47 +91,33 @@ impl ComboPool {
     }
 
     pub fn resolve_slots(&self, requested_model: &str, fallbacks: &[String]) -> Vec<ResolvedSlot> {
-        self.resolve_slots_for_session(requested_model, fallbacks, None, false)
+        self.resolve_slots_adaptive(requested_model, fallbacks, None, false, None, None, true)
     }
 
-    pub fn resolve_slots_for_session(
-        &self,
-        requested_model: &str,
-        fallbacks: &[String],
-        session_id: Option<&str>,
-        escalate: bool,
-    ) -> Vec<ResolvedSlot> {
-        self.resolve_slots_with_vault(requested_model, fallbacks, session_id, escalate, None, None)
+    pub fn resolve_slots_for_session(&self, requested_model: &str, fallbacks: &[String], session_id: Option<&str>, escalate: bool) -> Vec<ResolvedSlot> {
+        self.resolve_slots_adaptive(requested_model, fallbacks, session_id, escalate, None, None, true)
     }
 
-    pub fn resolve_slots_with_vault(
-        &self,
-        requested_model: &str,
-        fallbacks: &[String],
-        session_id: Option<&str>,
-        escalate: bool,
-        vault: Option<&AccountVault>,
-        quotas: Option<&QuotaTracker>,
+    pub fn resolve_slots_with_vault(&self, requested_model: &str, fallbacks: &[String], session_id: Option<&str>, escalate: bool, vault: Option<&AccountVault>, quotas: Option<&QuotaTracker>) -> Vec<ResolvedSlot> {
+        self.resolve_slots_adaptive(requested_model, fallbacks, session_id, escalate, vault, quotas, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_slots_adaptive(
+        &self, requested_model: &str, fallbacks: &[String], session_id: Option<&str>,
+        escalate: bool, vault: Option<&AccountVault>, quotas: Option<&QuotaTracker>, adaptive: bool,
     ) -> Vec<ResolvedSlot> {
         let req = requested_model.trim();
+        let tick = self.rr_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(combo_name) = req.strip_prefix("combo:") {
             let (mut targets, strategy) = self
                 .config
                 .read()
                 .ok()
-                .map(|g| {
-                    (
-                        g.combos.get(combo_name).cloned().unwrap_or_default(),
-                        g.strategies.get(combo_name).copied().unwrap_or_default(),
-                    )
-                })
+                .map(|g| (g.combos.get(combo_name).cloned().unwrap_or_default(), g.strategies.get(combo_name).copied().unwrap_or_default()))
                 .unwrap_or_default();
             if !targets.is_empty() {
-                let tick = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                if strategy == ComboStrategy::FlashFirst
-                    && targets.len() >= 2
-                    && self.is_or_latch_escalated(session_id, escalate)
-                {
+                if strategy == ComboStrategy::FlashFirst && targets.len() >= 2 && self.is_or_latch_escalated(session_id, escalate) {
                     targets.swap(0, 1);
                 } else if strategy == ComboStrategy::RoundRobin && targets.len() >= 2 {
                     let shift = tick % targets.len();
@@ -148,17 +127,46 @@ impl ComboPool {
             }
         }
 
-        let mut slots = Vec::with_capacity(1 + fallbacks.len());
+        let mut slots = Vec::new();
         if !req.is_empty() {
             slots.push(plain_slot(req));
         }
         for fb in fallbacks {
             let trimmed = fb.trim();
-            if !trimmed.is_empty() && !slots.iter().any(|s| s.model == trimmed) {
-                slots.push(plain_slot(trimmed));
+            if !trimmed.is_empty() {
+                push_unique_slot(&mut slots, plain_slot(trimmed));
             }
         }
+        if adaptive {
+            self.append_adaptive_slots(req, tick, vault, quotas, &mut slots);
+        }
         slots
+    }
+
+    fn append_adaptive_slots(&self, req: &str, tick: usize, vault: Option<&AccountVault>, quotas: Option<&QuotaTracker>, slots: &mut Vec<ResolvedSlot>) {
+        if let Some(v) = vault {
+            let m = if !req.is_empty() { req } else { "default" };
+            for acct in v.list_enabled() {
+                if quotas.is_none_or(|q| q.is_available(&acct.id, acct.daily_budget_usd)) {
+                    push_unique_slot(slots, ResolvedSlot {
+                        model: m.to_owned(), account_id: Some(acct.id.clone()),
+                        upstream: Some(acct.base_url.clone()), dialect: Some(acct.dialect.clone()),
+                        api_key: (!acct.secret.trim().is_empty()).then(|| acct.secret.clone()),
+                        slot_key: format!("{m}#acct:{}", acct.id),
+                    });
+                }
+            }
+        }
+        if let Ok(cfg) = self.config.read() {
+            let mut combo_targets = Vec::new();
+            for name in ["coding", "default"] {
+                if let Some(list) = cfg.combos.get(name) { combo_targets.extend(list.iter().cloned()); }
+            }
+            for (name, list) in &cfg.combos {
+                if name != "coding" && name != "default" { combo_targets.extend(list.iter().cloned()); }
+            }
+            for slot in expand_targets(&combo_targets, tick, vault, quotas) { push_unique_slot(slots, slot); }
+        }
     }
 
     fn is_or_latch_escalated(&self, session_id: Option<&str>, escalate: bool) -> bool {
@@ -177,6 +185,12 @@ impl ComboPool {
 
 fn plain_slot(model: &str) -> ResolvedSlot {
     ResolvedSlot { model: model.to_owned(), account_id: None, upstream: None, dialect: None, api_key: None, slot_key: model.to_owned() }
+}
+
+fn push_unique_slot(slots: &mut Vec<ResolvedSlot>, slot: ResolvedSlot) {
+    if !slots.iter().any(|s| s.model == slot.model && s.account_id == slot.account_id && s.upstream == slot.upstream) {
+        slots.push(slot);
+    }
 }
 
 fn expand_targets(targets: &[ComboTarget], tick: usize, vault: Option<&AccountVault>, quotas: Option<&QuotaTracker>) -> Vec<ResolvedSlot> {

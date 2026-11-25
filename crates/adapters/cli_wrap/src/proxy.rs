@@ -159,11 +159,11 @@ async fn handle_request(
         || is_passthrough_path(&path_and_query);
 
     let mut req_opts = parse_request_options(&headers, tenant_hash, &route.provider_id);
-    let fallbacks = if let Ok(pol) = state.policy.read() {
+    let (fallbacks, adaptive_fallback) = if let Ok(pol) = state.policy.read() {
         pol.apply_to_request(&mut req_opts, &headers);
-        pol.fallback_models.clone()
+        (pol.fallback_models.clone(), pol.adaptive_fallback)
     } else {
-        Vec::new()
+        (Vec::new(), true)
     };
     let client_tag = detect_client_tag(&headers);
     let (outbound_body, mut pending) = if should_bypass {
@@ -178,8 +178,8 @@ async fn handle_request(
     } else {
         let sid = pending.as_ref().map(|p| p.session_id.as_str());
         let escalate = pending.as_ref().is_some_and(|p| p.escalate_to_frontier);
-        state.combos.resolve_slots_with_vault(
-            &extract_model(&outbound_body), &fallbacks, sid, escalate, Some(&state.accounts), Some(&state.quotas),
+        state.combos.resolve_slots_adaptive(
+            &extract_model(&outbound_body), &fallbacks, sid, escalate, Some(&state.accounts), Some(&state.quotas), adaptive_fallback,
         )
     };
     let Some(disp) = dispatch_with_failover(

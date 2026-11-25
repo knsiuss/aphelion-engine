@@ -12,6 +12,7 @@ pub struct RuntimePolicy {
     pub fast_model: Option<String>,
     pub fallback_models: Vec<String>,
     pub auto_reasoning: String,
+    pub adaptive_fallback: bool,
 }
 
 impl Default for RuntimePolicy {
@@ -46,6 +47,9 @@ impl Default for RuntimePolicy {
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| matches!(s.as_str(), "off" | "safe"))
             .unwrap_or_else(|| "off".to_owned());
+        let adaptive_fallback = !std::env::var("APHELION_ADAPTIVE_FALLBACK")
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0"));
         Self {
             output_mode: "concise".to_owned(),
             compaction_mode: "auto".to_owned(),
@@ -54,6 +58,7 @@ impl Default for RuntimePolicy {
             fast_model,
             fallback_models,
             auto_reasoning,
+            adaptive_fallback,
         }
     }
 }
@@ -67,6 +72,7 @@ pub struct PolicyPatch {
     pub fast_model: Option<String>,
     pub fallback_models: Option<Vec<String>>,
     pub auto_reasoning: Option<String>,
+    pub adaptive_fallback: Option<bool>,
 }
 
 impl RuntimePolicy {
@@ -106,6 +112,9 @@ impl RuntimePolicy {
             if matches!(ar.as_str(), "off" | "safe") {
                 self.auto_reasoning = ar;
             }
+        }
+        if let Some(af) = patch.adaptive_fallback {
+            self.adaptive_fallback = af;
         }
     }
 

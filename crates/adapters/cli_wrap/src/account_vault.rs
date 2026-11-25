@@ -153,6 +153,21 @@ impl AccountVault {
             .unwrap_or_default()
     }
 
+    pub fn list_enabled(&self) -> Vec<ProviderAccount> {
+        let mut list: Vec<ProviderAccount> = self
+            .accounts
+            .read()
+            .map(|g| g.iter().filter(|a| a.enabled).cloned().collect())
+            .unwrap_or_default();
+        list.sort_by_key(|a| match a.tier {
+            AccountTier::Free => 0u8,
+            AccountTier::Subscription => 1,
+            AccountTier::Cheap => 2,
+            AccountTier::Paid => 3,
+        });
+        list
+    }
+
     pub fn get(&self, id: &str) -> Option<ProviderAccount> {
         self.accounts
             .read()

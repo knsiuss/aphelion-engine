@@ -48,10 +48,10 @@ All endpoints live under the same origin (`/api/...`). Append `tokQuery` (`?toke
 
 | Endpoint | Method | Purpose & Payload |
 | :--- | :--- | :--- |
-| `/api/overview` | `GET` | `{ kpis, by_provider_model, recent, timeseries, policy }` |
+| `/api/overview` | `GET` | `{ kpis, by_provider_model, recent, timeseries, policy }` (`policy` includes `adaptive_fallback: bool` and `fallback_models: string[]`) |
 | `/api/topology` | `GET` | `{ uptime_secs, clients, upstreams, engine }` for SVG graph |
 | `/api/events` | `GET` | `EventSource` SSE (`event: request`, JSON `TelemetryEvent`) |
-| `/api/policy` | `POST` | `{ output_mode, compaction_mode, reasoning_effort }` |
+| `/api/policy` | `POST` | `{ output_mode?, compaction_mode?, reasoning_effort?, adaptive_fallback?, fallback_models? }` |
 | `/api/accounts` | `GET` | `{ accounts: [{ account: { id, label, provider, base_url, dialect, tier, secret_masked, enabled, daily_budget_usd }, quota: { status, cooldown_remaining_secs, requests_today, tokens_today, cost_today_usd } }] }` |
 | `/api/accounts` | `POST` | Upsert `ProviderAccount` JSON (`id`, `provider`, `base_url`, `secret`, `dialect`: `"openai" \| "anthropic"`, `tier`: `"free" \| "subscription" \| "cheap" \| "paid"`, `enabled`: `true`) |
 | `/api/accounts/:id` | `DELETE` | Remove account by ID |
