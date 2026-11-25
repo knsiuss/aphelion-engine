@@ -1,8 +1,15 @@
+pub mod audit_report;
 pub mod cli_audit;
+pub mod cli_commands;
 pub mod headers;
+pub mod metrics;
 pub mod proxy;
 pub mod public_guard;
 pub mod router;
 pub mod spawn;
 pub mod sse_stream;
 pub mod telemetry_sink;
+pub mod top_view;
+pub mod ui_api;
+pub mod ui_queries;
+pub mod ui_state;

@@ -79,7 +79,10 @@ pub fn print_summary(summary: &SessionCostSummary) {
 pub fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  aphelion [--audit] [--port <u16>] [--upstream <url>] <command> [args...]");
-    eprintln!("  aphelion serve [--public] [--bind <addr>] [--port 18787] [--rpm 120] [--max-body-mb 10] [--audit]");
+    eprintln!("  aphelion serve [--public] [--admin-token <secret>] [--bind <addr>] [--port 18787] [--rpm 120] [--max-body-mb 10] [--audit]");
+    eprintln!("  aphelion ui [--port 18787]");
+    eprintln!("  aphelion top [--interval <secs>] [--db <path>]");
     eprintln!("  aphelion doctor");
-    eprintln!("  aphelion --audit-summary | --audit-export <output.jsonl>");
+    eprintln!("  aphelion --audit-summary [--provider <name>] [--model <sub >] [--last <1h|24h|7d>]");
+    eprintln!("  aphelion --audit-export <output.jsonl>");
 }

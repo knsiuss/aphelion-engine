@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Aphelion v3.2 — Live Telemetry &amp; Routing</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <strong>APHELION</strong>
+      <span class="ver">v3.2</span>
+    </div>
+    <nav class="tabs" id="nav-tabs">
+      <button class="tab active" data-tab="topology">Topology</button>
+      <button class="tab" data-tab="analytics">Analytics</button>
+      <button class="tab" data-tab="providers">Providers</button>
+      <button class="tab" data-tab="connect">Quick Connect</button>
+    </nav>
+    <div class="status-pills">
+      <span class="pill" id="sse-pill"><i class="dot"></i><span id="sse-label">Connecting</span></span>
+      <span class="pill mono" id="uptime-pill">0s</span>
+      <span class="pill mono" id="port-pill">:18787</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="kpi-grid" id="kpi-grid">
+      <div class="card kpi"><span class="k-label">Total Requests</span><span class="k-val mono" id="kpi-req">0</span></div>
+      <div class="card kpi"><span class="k-label">Verified Cache Hit</span><span class="k-val mono green" id="kpi-hit">0.0%</span></div>
+      <div class="card kpi"><span class="k-label">Net Verified Saved</span><span class="k-val mono green" id="kpi-saved">$0.0000</span></div>
+      <div class="card kpi"><span class="k-label">Avg TTFT</span><span class="k-val mono" id="kpi-ttft">0ms</span></div>
+      <div class="card kpi"><span class="k-label">In (Cached / Uncached)</span><span class="k-val mono" id="kpi-in">0 / 0</span></div>
+      <div class="card kpi"><span class="k-label">Out (Reasoning)</span><span class="k-val mono" id="kpi-out">0 (0)</span></div>
+    </section>
+
+    <section class="panel active" id="tab-topology">
+      <div class="card">
+        <div class="card-head">
+          <h2>Live Routing Topology</h2>
+          <div class="policy-bar">
+            <label>Output
+              <select id="pol-output">
+                <option value="concise">concise</option>
+                <option value="verbose">verbose</option>
+              </select>
+            </label>
+            <label>Compaction
+              <select id="pol-compact">
+                <option value="auto">auto</option>
+                <option value="off">off</option>
+              </select>
+            </label>
+            <label>Reasoning
+              <select id="pol-reason">
+                <option value="default">default</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="topo-wrap"><svg id="topo-svg" viewBox="0 0 960 340" preserveAspectRatio="xMidYMid meet"></svg></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Live Activity Feed</h2><span class="muted">Last 50 requests (SSE)</span></div>
+        <div class="feed" id="live-feed"><div class="empty">Waiting for live traffic...</div></div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-analytics">
+      <div class="card">
+        <div class="card-head">
+          <h2>Token Distribution (Last 24h)</h2>
+          <div class="legend">
+            <span><i class="sw sw-cached"></i>Cached In</span>
+            <span><i class="sw sw-uncached"></i>Uncached In</span>
+            <span><i class="sw sw-output"></i>Output</span>
+            <span><i class="sw sw-reason"></i>Reasoning</span>
+          </div>
+        </div>
+        <canvas id="token-chart" width="920" height="260"></canvas>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-providers">
+      <div class="card">
+        <div class="card-head">
+          <h2>Provider &amp; Model Breakdown</h2>
+          <input id="pm-filter" class="search" type="text" placeholder="Filter provider or model..." />
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th data-sort="provider">Provider</th>
+                <th data-sort="model">Model</th>
+                <th class="num" data-sort="req">Req</th>
+                <th class="num" data-sort="avg_ttft_ms">Avg TTFT</th>
+                <th class="num" data-sort="cache_hit_pct">Cache Hit %</th>
+                <th class="num" data-sort="cached_in">In (Cached/Uncached)</th>
+                <th class="num" data-sort="output">Out (Reason)</th>
+                <th class="num" data-sort="net_saved_usd">Net Saved</th>
+              </tr>
+            </thead>
+            <tbody id="pm-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-connect">
+      <div class="connect-grid" id="connect-grid"></div>
+    </section>
+  </main>
+
+  <script src="/ui/charts.js"></script>
+  <script src="/ui/topology.js"></script>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

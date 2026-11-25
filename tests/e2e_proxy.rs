@@ -230,7 +230,8 @@ async fn e2e_multiturn_prefix_freeze_sse_dialects_gzip_and_429_passthrough() {
         .unwrap()
         .summarize()
         .unwrap();
-    assert_eq!(audit_sum.total_requests, 4);
+    // 4 successful turns + 1 upstream 429 error captured with status_code in v3.1
+    assert_eq!(audit_sum.total_requests, 5);
     assert!(audit_sum.total_cache_read_tokens >= 920);
 
     server.abort();

@@ -2,8 +2,6 @@ use crate::headers::{join_base_path, UpstreamTargets};
 use crate::public_guard::{extract_raw_credential, validate_upstream_ssrf, GuardRejection};
 use hyper::HeaderMap;
 use serde_json::Value;
-use std::env;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoute {
@@ -36,8 +34,15 @@ impl AutoRouter {
             if public_mode {
                 validate_upstream_ssrf(override_base)?;
             }
+            let prov = headers
+                .get("x-aphelion-provider")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| derive_provider_label(override_base));
             return Ok(ResolvedRoute {
-                provider_id: "custom".to_owned(),
+                provider_id: prov,
                 target_url: join_base_path(override_base, path_and_query),
             });
         }
@@ -178,7 +183,7 @@ fn detect_provider_by_model<'a>(
         Some(("xai", "https://api.x.ai/v1"))
     } else if m.starts_with("sonar-") {
         Some(("perplexity", "https://api.perplexity.ai"))
-    } else if m.starts_with("mistral-") || m.starts_with("codestral-") {
+    } else if m.starts_with("mistral-") || m.starts_with("devstral-") || m.starts_with("codestral-") {
         Some(("mistral", "https://api.mistral.ai/v1"))
     } else if m.starts_with("deepseek-") && !m.contains(':') {
         Some(("deepseek", "https://api.deepseek.com/v1"))
@@ -189,45 +194,30 @@ fn detect_provider_by_model<'a>(
     }
 }
 
-/// `aphelion doctor`: detects local IDEs and prints 1-line `baseURL` integration snippets
-/// without reading or modifying any user secrets.
-pub fn run_doctor() {
-    let home = env::var("USERPROFILE")
-        .or_else(|_| env::var("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-
-    println!("Aphelion v3 Doctor — Zero-Config IDE Onboarding");
-    println!("Start gateway: aphelion serve --port 18787 --audit\n");
-
-    let checks = [
-        (
-            "OpenCode",
-            home.join(".config/opencode"),
-            r#"Set provider baseURL: "http://127.0.0.1:18787/v1""#,
-        ),
-        (
-            "Cursor",
-            home.join(".cursor"),
-            "Settings -> Models -> Override OpenAI Base URL: http://127.0.0.1:18787/v1",
-        ),
-        (
-            "Cline",
-            home.join(".vscode/extensions"),
-            "Cline Settings -> OpenAI Compatible Base URL: http://127.0.0.1:18787/v1",
-        ),
-        (
-            "Continue",
-            home.join(".continue"),
-            "config.yaml -> apiBase: http://127.0.0.1:18787/v1",
-        ),
-    ];
-    for (name, path, hint) in checks {
-        let status = if path.exists() {
-            "DETECTED"
-        } else {
-            "not found"
+/// Derives a clean, dynamic provider label from any custom URL:
+/// e.g., `https://api.moonshot.cn/v1` -> `"moonshot.cn"`,
+/// `http://127.0.0.1:8000/v1` -> `"local:8000"`.
+pub fn derive_provider_label(url_str: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url_str.trim()) else {
+        return "custom".to_owned();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "custom".to_owned();
+    };
+    let lower = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if matches!(lower.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") {
+        return match parsed.port() {
+            Some(p) => format!("local:{p}"),
+            None => "local".to_owned(),
         };
-        println!("  [{status:^9}] {name:<10} -> {hint}");
+    }
+    let clean = lower
+        .strip_prefix("api.")
+        .or_else(|| lower.strip_prefix("www."))
+        .unwrap_or(&lower);
+    if clean.is_empty() {
+        "custom".to_owned()
+    } else {
+        clean.to_owned()
     }
 }

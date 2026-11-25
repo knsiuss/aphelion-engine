@@ -9,6 +9,7 @@ pub mod compressor_rules;
 pub mod diet_gc;
 pub mod economizer;
 pub mod economizer_rules;
+pub mod flight_recorder;
 pub mod ingress_opt;
 pub mod normalizer;
 pub mod optical_history;

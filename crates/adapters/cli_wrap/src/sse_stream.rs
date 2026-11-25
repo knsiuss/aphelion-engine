@@ -10,15 +10,11 @@ use hyper::body::Frame;
 use hyper::{Response, StatusCode};
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 pub fn reject_response(rej: GuardRejection, state: &ProxyState) -> Response<BoxBody> {
     if rej.status == StatusCode::TOO_MANY_REQUESTS {
-        state
-            .metrics
-            .rate_limited_429
-            .fetch_add(1, Ordering::Relaxed);
+        state.metrics.record_rate_limited();
     }
     let mut b = Response::builder()
         .status(rej.status)
@@ -82,11 +78,14 @@ pub fn stream_sse_response(
         );
         async move {
             let chunk = item.unwrap_or_default();
-            if let Ok(mut t) = ttft_cell.lock() {
-                if t.is_none() {
-                    if let Ok(p) = pending_cell.lock() {
-                        if let Some(ref turn) = *p {
-                            *t = Some(turn.started_at.elapsed().as_millis() as u64);
+            if !chunk.is_empty() {
+                if let Ok(mut t) = ttft_cell.lock() {
+                    if t.is_none() {
+                        if let Ok(p) = pending_cell.lock() {
+                            if let Some(ref turn) = *p {
+                                let ms = (turn.started_at.elapsed().as_millis() as u64).max(1);
+                                *t = Some(ms);
+                            }
                         }
                     }
                 }
@@ -103,9 +102,9 @@ pub fn stream_sse_response(
                 if let Ok(mut p) = pending_cell.lock() {
                     if let Some(turn) = p.take() {
                         let usage = state.session.lock().ok().and_then(|s| s.last_usage.clone());
-                        let total_ms = turn.started_at.elapsed().as_millis() as u64;
+                        let total_ms = (turn.started_at.elapsed().as_millis() as u64).max(1);
                         let ttft_ms = ttft_cell.lock().ok().and_then(|t| *t).unwrap_or(total_ms);
-                        finalize_turn(&state, turn, usage, ttft_ms, total_ms, String::new());
+                        finalize_turn(&state, turn, usage, status.as_u16(), ttft_ms, total_ms);
                     }
                 }
             }

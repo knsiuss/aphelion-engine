@@ -208,6 +208,7 @@ async fn public_guard_enforces_401_ssrf_403_tenant_isolation_and_metrics() {
             public_mode: true,
             rpm_limit: 10,
             max_body_bytes: 1024 * 1024,
+            admin_token: None,
         },
         None,
     ));

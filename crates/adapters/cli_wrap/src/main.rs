@@ -1,9 +1,11 @@
-use aphelion_cli::cli_audit::{print_summary, print_usage, run_audit_export, run_audit_summary};
+use aphelion_cli::audit_report::run_audit_summary_cmd;
+use aphelion_cli::cli_audit::{print_summary, print_usage, run_audit_export};
+use aphelion_cli::cli_commands::{run_doctor, run_ui_open};
 use aphelion_cli::headers::UpstreamTargets;
 use aphelion_cli::proxy::{run_proxy_server, ProxyState};
 use aphelion_cli::public_guard::PublicConfig;
-use aphelion_cli::router::run_doctor;
 use aphelion_cli::spawn::build_child_command;
+use aphelion_cli::top_view::run_top;
 use aphelion_telemetry::audit::AuditLedger;
 use std::env;
 use std::process::ExitCode;
@@ -13,6 +15,7 @@ use tokio::net::TcpListener;
 struct CliFlags {
     audit: bool,
     public: bool,
+    admin_token: Option<String>,
     port: u16,
     bind: Option<String>,
     rpm: u32,
@@ -31,7 +34,9 @@ async fn main() -> ExitCode {
             run_doctor();
             return ExitCode::SUCCESS;
         }
-        Some("--audit-summary") => return run_audit_summary(&db_path),
+        Some("ui") => return run_ui_open(&args[1..]),
+        Some("top") => return run_top(&args[1..], &db_path).await,
+        Some("--audit-summary") => return run_audit_summary_cmd(&db_path, &args[1..]),
         Some("--audit-export") => {
             let Some(out) = args.get(1) else {
                 eprintln!("Usage: aphelion --audit-export <output.jsonl>");
@@ -119,9 +124,13 @@ async fn run_gateway_mode(args: &[String], db_path: &str) -> ExitCode {
         public_mode: flags.public,
         rpm_limit: flags.rpm,
         max_body_bytes: flags.max_body_mb.saturating_mul(1024 * 1024),
+        admin_token: flags.admin_token,
     };
     let mode_tag = if flags.public { "public" } else { "local" };
-    eprintln!("[aphelion v3] listening on http://{local_addr} (mode={mode_tag}) -> {primary}");
+    eprintln!("[aphelion v3.2] listening on http://{local_addr} (mode={mode_tag}) -> {primary}");
+    if !flags.public {
+        eprintln!("[aphelion v3.2] local dashboard: http://{local_addr}/ui");
+    }
 
     let state = Arc::new(ProxyState::with_config(
         targets,
@@ -139,6 +148,7 @@ fn parse_flags(args: &[String], default_port: u16) -> CliFlags {
     let mut f = CliFlags {
         audit: false,
         public: false,
+        admin_token: None,
         port: default_port,
         bind: None,
         rpm: 120,
@@ -155,6 +165,10 @@ fn parse_flags(args: &[String], default_port: u16) -> CliFlags {
             "--public" => {
                 f.public = true;
                 f.cmd_start += 1;
+            }
+            "--admin-token" if f.cmd_start + 1 < args.len() => {
+                f.admin_token = Some(args[f.cmd_start + 1].clone());
+                f.cmd_start += 2;
             }
             "--port" if f.cmd_start + 1 < args.len() => {
                 f.port = args[f.cmd_start + 1].parse().unwrap_or(default_port);

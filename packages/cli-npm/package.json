@@ -1,6 +1,6 @@
 {
   "name": "aphelion-engine",
-  "version": "3.0.1",
+  "version": "3.2.0",
   "description": "Zero-config KV-cache-preserving AI token optimization gateway for coding agents, SDKs, and routers",
   "license": "MIT",
   "repository": {

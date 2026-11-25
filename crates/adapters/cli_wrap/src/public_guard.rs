@@ -1,7 +1,7 @@
+pub use crate::metrics::MetricsRegistry;
 use hyper::{HeaderMap, StatusCode};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
@@ -11,6 +11,7 @@ pub struct PublicConfig {
     pub public_mode: bool,
     pub rpm_limit: u32,
     pub max_body_bytes: usize,
+    pub admin_token: Option<String>,
 }
 
 impl Default for PublicConfig {
@@ -19,6 +20,7 @@ impl Default for PublicConfig {
             public_mode: false,
             rpm_limit: 120,
             max_body_bytes: 10 * 1024 * 1024,
+            admin_token: None,
         }
     }
 }
@@ -169,46 +171,6 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
-    }
-}
-
-/// Zero-dependency atomic Prometheus metrics registry for `GET /metrics` and `GET /health`.
-#[derive(Default)]
-pub struct MetricsRegistry {
-    pub requests_total: AtomicU64,
-    pub rate_limited_429: AtomicU64,
-    pub uncached_input_tokens: AtomicU64,
-    pub cached_read_tokens: AtomicU64,
-    pub output_tokens: AtomicU64,
-    pub reasoning_tokens: AtomicU64,
-    pub compactions_total: AtomicU64,
-}
-
-impl MetricsRegistry {
-    pub fn render_prometheus(&self) -> String {
-        let reqs = self.requests_total.load(Ordering::Relaxed);
-        let r429 = self.rate_limited_429.load(Ordering::Relaxed);
-        let uncached = self.uncached_input_tokens.load(Ordering::Relaxed);
-        let cached = self.cached_read_tokens.load(Ordering::Relaxed);
-        let output = self.output_tokens.load(Ordering::Relaxed);
-        let reasoning = self.reasoning_tokens.load(Ordering::Relaxed);
-        let compactions = self.compactions_total.load(Ordering::Relaxed);
-        let denom = uncached.saturating_add(cached);
-        let hit_ratio = if denom == 0 {
-            0.0
-        } else {
-            cached as f64 / denom as f64
-        };
-        format!(
-            "aphelion_requests_total {reqs}\n\
-             aphelion_rate_limited_429_total {r429}\n\
-             aphelion_cache_hit_ratio {hit_ratio:.4}\n\
-             aphelion_uncached_input_tokens_total {uncached}\n\
-             aphelion_cached_read_tokens_total {cached}\n\
-             aphelion_output_tokens_total {output}\n\
-             aphelion_reasoning_tokens_total {reasoning}\n\
-             aphelion_compactions_total {compactions}\n"
-        )
     }
 }
 
