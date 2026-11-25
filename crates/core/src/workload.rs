@@ -97,6 +97,8 @@ pub fn is_passthrough_path(path: &str) -> bool {
         "/api/show",
         "/api/ps",
         "/api/pull",
+        "/count_tokens",
+        "/tokenize",
     ];
     BYPASS_SEGMENTS.iter().any(|seg| lower.contains(seg))
 }

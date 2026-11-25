@@ -20,10 +20,18 @@ pub fn apply_prefix_lock(
     state: &mut SessionState,
 ) -> Result<(), CoreError> {
     state.sacred_cache_boundary = state.sacred_cache_boundary.max(ir.sacred_boundary);
+    state.system_has_cache_control |= ir.system_has_cache_control;
+    state.last_cached_msg_idx = match (state.last_cached_msg_idx, ir.last_cached_msg_idx) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
     let key = state.ledger_key(&ir.model_id);
 
     // Explicit `cache_control` breakpoints are Sacred Read-Only Zones: zero reordering.
-    if state.sacred_cache_boundary > 0 {
+    if state.system_has_cache_control
+        || state.last_cached_msg_idx.is_some()
+        || state.sacred_cache_boundary > 0
+    {
         if ir.is_turn_zero {
             let wire = serde_json::to_vec(&ir.root)?;
             let bound = state.sacred_cache_boundary.min(wire.len());
@@ -38,6 +46,7 @@ pub fn apply_prefix_lock(
                 ir.ingress_start = replay_frozen_history(msgs, &record);
             }
         }
+        ir.ingress_start = ir.mutable_ingress_start();
         return Ok(());
     }
 

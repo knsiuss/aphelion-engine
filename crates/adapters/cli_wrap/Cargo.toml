@@ -45,3 +45,15 @@ path = "../../../tests/observability_v31.rs"
 [[test]]
 name = "ui_and_router_v32"
 path = "../../../tests/ui_and_router_v32.rs"
+
+[[test]]
+name = "claude_code_compat"
+path = "../../../tests/claude_code_compat.rs"
+
+[[test]]
+name = "claude_code_cache_v34"
+path = "../../../tests/claude_code_cache_v34.rs"
+
+[[test]]
+name = "audit_remediation_v33"
+path = "../../../tests/audit_remediation_v33.rs"

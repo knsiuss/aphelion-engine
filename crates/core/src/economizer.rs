@@ -1,5 +1,5 @@
 use crate::economizer_rules::{infer_active_tools, match_micro_skill};
-use crate::types::{Complexity, NormalizedRequest, SessionState, SlmRouteDecision};
+use crate::types::{Complexity, Dialect, NormalizedRequest, SessionState, SlmRouteDecision};
 use serde_json::Value;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -38,7 +38,12 @@ pub fn apply_governance(ir: &mut NormalizedRequest, state: &mut SessionState) {
         }
     }
 
-    if ir.active_tool_loop {
+    // Never inject blocking soft tool-gating on Anthropic/cache_control sessions:
+    // it causes agent aborts (blocking Write/Bash) and breaks sliding message caches.
+    let skip_tool_gate = ir.dialect == Dialect::AnthropicMessages
+        || ir.system_has_cache_control
+        || ir.last_cached_msg_idx.is_some();
+    if ir.active_tool_loop && !skip_tool_gate {
         let inferred = infer_active_tools(&ir.root, last_text.as_deref().unwrap_or_default());
         let scope = if inferred.is_empty() {
             "minimal required tools".to_owned()
@@ -46,7 +51,7 @@ pub fn apply_governance(ir: &mut NormalizedRequest, state: &mut SessionState) {
             inferred.join(", ")
         };
         ir.tail_directives.push(format!(
-            "[Active Tool Scope: {scope} only; ignore all other tools]"
+            "[Active Tool Scope: prioritize {scope} when relevant; all declared tools remain available]"
         ));
     }
 
@@ -99,9 +104,15 @@ fn evaluate_compiled_slm_route(
     let count = state.workflow_counts.entry(sig).or_insert(0);
     *count += 1;
     if *count >= COMPILED_SLM_THRESHOLD {
+        let endpoint = state
+            .request_options
+            .slm_endpoint
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::defaults::DEFAULT_SLM_ENDPOINT.to_owned());
         ir.slm_route = SlmRouteDecision::CompiledSlm {
             workflow_id: format!("wf_{sig:016x}"),
-            endpoint: "http://127.0.0.1:8081/v1".to_owned(),
+            endpoint,
         };
     }
 }

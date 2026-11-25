@@ -1,12 +1,11 @@
-use crate::diet_gc::estimate_calibrated_tokens;
-use crate::prefix_ledger::{
-    commit_outbound_messages, FrozenSessionRecord, MACRO_COMPACTION_WATERMARK_TOKENS,
+use crate::defaults::{
+    DEFAULT_COMPACTION_THRESHOLD_TOKENS, DEFAULT_LOCKED_TAIL_MESSAGES,
+    DEFAULT_PROJECTED_REMAINING_TURNS,
 };
+use crate::diet_gc::estimate_calibrated_tokens;
+use crate::prefix_ledger::{commit_outbound_messages, FrozenSessionRecord};
 use crate::types::{CompactMode, NormalizedRequest, SessionState};
 use serde_json::{json, Value};
-
-const LOCKED_TAIL_MESSAGES: usize = 6;
-const PROJECTED_REMAINING_TURNS: usize = 12;
 
 /// Amortized Break-Even Gate for Macro-Compaction:
 /// Strictly NO per-turn micro-GC. Triggers ONLY when `mode == Force` OR (`mode == Auto` AND
@@ -17,14 +16,31 @@ pub fn should_compact(
     threshold_tokens: usize,
     breaker_tripped: bool,
 ) -> Option<(usize, usize)> {
-    if mode == CompactMode::Off || messages.len() <= LOCKED_TAIL_MESSAGES + 2 {
+    should_compact_with_tail(
+        messages,
+        mode,
+        threshold_tokens,
+        DEFAULT_LOCKED_TAIL_MESSAGES,
+        breaker_tripped,
+    )
+}
+
+pub fn should_compact_with_tail(
+    messages: &[Value],
+    mode: CompactMode,
+    threshold_tokens: usize,
+    tail_keep: usize,
+    breaker_tripped: bool,
+) -> Option<(usize, usize)> {
+    let keep = tail_keep.max(2);
+    if mode == CompactMode::Off || messages.len() <= keep + 2 {
         return None;
     }
     if breaker_tripped && mode != CompactMode::Force {
         return None;
     }
 
-    let tail_start = messages.len() - LOCKED_TAIL_MESSAGES;
+    let tail_start = messages.len() - keep;
     let total_tokens: usize = messages
         .iter()
         .map(|m| estimate_calibrated_tokens(&m.to_string()))
@@ -47,7 +63,8 @@ pub fn should_compact(
 
     // Amortized cost inequality: post_compact * 1.0 < reclaimed * 0.10 * projected_remaining_turns
     let re_prefill_cost = post_compact_tokens as f64;
-    let projected_savings = (tokens_reclaimed as f64) * 0.10 * (PROJECTED_REMAINING_TURNS as f64);
+    let projected_savings =
+        (tokens_reclaimed as f64) * 0.10 * (DEFAULT_PROJECTED_REMAINING_TURNS as f64);
     if re_prefill_cost < projected_savings {
         Some((total_tokens, tokens_reclaimed))
     } else {
@@ -56,10 +73,10 @@ pub fn should_compact(
 }
 
 /// Root- & Tail-Preserving Structured Checkpoint with Atomic `PrefixLedger` Epoch Rollover:
-/// Locks Turn 0 (`messages[0]`, System, `tools[]`) and latest `K = 6` tail messages verbatim,
+/// Locks Turn 0 (`messages[0]`, System, `tools[]`) and latest `K` tail messages verbatim,
 /// collapsing middle `1..tail_start` into a deterministic `[APHELION_CHECKPOINT]` message.
 pub fn run_amortized_compaction(ir: &mut NormalizedRequest, state: &mut SessionState) {
-    if ir.is_turn_zero || state.sacred_cache_boundary > 0 {
+    if ir.is_turn_zero {
         return;
     }
     let key = state.ledger_key(&ir.model_id);
@@ -69,20 +86,26 @@ pub fn run_amortized_compaction(ir: &mut NormalizedRequest, state: &mut SessionS
         .map(|r| r.cache_drop_breaker_tripped)
         .unwrap_or(false);
     let mode = state.request_options.compact_mode;
+    let threshold = state
+        .request_options
+        .compaction_threshold_tokens
+        .unwrap_or(DEFAULT_COMPACTION_THRESHOLD_TOKENS);
+    let tail_keep = state
+        .request_options
+        .locked_tail_messages
+        .unwrap_or(DEFAULT_LOCKED_TAIL_MESSAGES)
+        .max(2);
 
     let Some(messages) = ir.root.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let Some((_total, reclaimed)) = should_compact(
-        messages,
-        mode,
-        MACRO_COMPACTION_WATERMARK_TOKENS,
-        breaker_tripped,
-    ) else {
+    let Some((_total, reclaimed)) =
+        should_compact_with_tail(messages, mode, threshold, tail_keep, breaker_tripped)
+    else {
         return;
     };
 
-    let mut tail_start = messages.len() - LOCKED_TAIL_MESSAGES;
+    let mut tail_start = messages.len() - tail_keep;
     // Align tail_start backward so we never orphan a `role: "tool"` / `tool_result` from its assistant call.
     while tail_start > 1 && is_tool_response(&messages[tail_start]) {
         tail_start -= 1;
@@ -107,6 +130,8 @@ pub fn run_amortized_compaction(ir: &mut NormalizedRequest, state: &mut SessionS
     rec.compaction_epoch += 1;
     commit_outbound_messages(messages, rec);
     ir.ingress_start = messages.len();
+    ir.last_cached_msg_idx = messages.iter().rposition(crate::normalizer::has_cache_control);
+    state.last_cached_msg_idx = ir.last_cached_msg_idx;
     ir.stage_stats.macro_compaction_triggered = true;
     ir.stage_stats.compaction_tokens_reclaimed = reclaimed;
     ir.stage_stats.diet_gc_compacted_tokens = reclaimed;

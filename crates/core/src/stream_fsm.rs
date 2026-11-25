@@ -63,8 +63,8 @@ impl StreamFsm {
                 }
                 break;
             }
-            if let Some(pos) = find_subslice(&self.sse_line_buf, b"\n\n") {
-                let frame: Vec<u8> = self.sse_line_buf.drain(..pos + 2).collect();
+            if let Some((pos, sep_len)) = find_sse_frame_end(&self.sse_line_buf) {
+                let frame: Vec<u8> = self.sse_line_buf.drain(..pos + sep_len).collect();
                 output.extend_from_slice(&sse_dialect::process_sse_frame(self, &frame, session));
                 if self.loop_broken {
                     output.extend_from_slice(LOOP_STOP_SSE);
@@ -216,6 +216,15 @@ fn utf8_complete_prefix_len(bytes: &[u8]) -> usize {
         Ok(_) => bytes.len(),
         Err(err) if err.error_len().is_none() => err.valid_up_to(),
         Err(_) => bytes.len(),
+    }
+}
+
+fn find_sse_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buf, b"\n\n").map(|p| (p, 2));
+    let crlf = find_subslice(buf, b"\r\n\r\n").map(|p| (p, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
     }
 }
 

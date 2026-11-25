@@ -27,7 +27,7 @@ pub fn compose_outbound(
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
-    let has_new_ingress = msg_len > ir.ingress_start;
+    let has_new_ingress = msg_len > ir.mutable_ingress_start();
 
     let allow_tail_directives = !ir.stage_stats.cache_drop_breaker_active
         && has_new_ingress
@@ -36,14 +36,20 @@ pub fn compose_outbound(
             WorkloadClass::AgenticLoop | WorkloadClass::DirectCodeEdit
         );
 
+    let is_cached_anthropic = ir.dialect == Dialect::AnthropicMessages
+        && (ir.system_has_cache_control || ir.last_cached_msg_idx.is_some());
     if allow_tail_directives {
-        if let Some(anchor) = &state.last_thought_anchor {
-            if flags.ast_block_priming || flags.economizer_gates {
-                ir.tail_directives
-                    .push(format!("[Prior Reasoning Anchor: {anchor}]"));
+        if !is_cached_anthropic {
+            if let Some(anchor) = &state.last_thought_anchor {
+                if flags.ast_block_priming || flags.economizer_gates {
+                    ir.tail_directives
+                        .push(format!("[Prior Reasoning Anchor: {anchor}]"));
+                }
             }
         }
-        if !ir.tail_directives.is_empty() {
+        if !ir.tail_directives.is_empty()
+            && (!is_cached_anthropic || ir.stage_stats.circuit_breaker_tripped)
+        {
             let suffix = format!("\n\n{}", ir.tail_directives.join("\n"));
             append_to_final_message(&mut ir.root, &suffix);
         }
@@ -76,9 +82,14 @@ pub fn compose_outbound(
         }
     }
 
-    // Commit canonical outbound messages into PrefixLedger so next turn replays `0..n` verbatim.
+    // Commit canonical outbound messages/input into PrefixLedger so next turn replays `0..n` verbatim.
     if flags.prefix_lock {
-        if let Some(messages) = ir.root.get("messages").and_then(Value::as_array) {
+        if let Some(messages) = ir
+            .root
+            .get("messages")
+            .or_else(|| ir.root.get("input"))
+            .and_then(Value::as_array)
+        {
             let key = state.ledger_key(&ir.model_id);
             let rec = state.prefix_ledger.get_or_insert_mut(key);
             commit_outbound_messages(messages, rec);

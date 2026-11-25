@@ -1,13 +1,17 @@
+use crate::config::GatewayConfig;
 use crate::headers::{
-    apply_proxy_headers, decode_incoming_body, has_bypass_header, parse_request_options,
+    apply_proxy_headers, decode_incoming_body_bounded, has_bypass_header, parse_request_options,
     UpstreamTargets,
 };
+use crate::provider_registry::{DEFAULT_GEMINI_BASE, DEFAULT_OLLAMA_BASE};
 use crate::public_guard::{
-    extract_tenant_hash, render_health_json, MetricsRegistry, PublicConfig, SlidingWindowLimiter,
+    extract_tenant_hash, redact_path_query, render_health_json, MetricsRegistry, PublicConfig,
+    SlidingWindowLimiter,
 };
 use crate::router::AutoRouter;
 use crate::sse_stream::{
-    apply_non_streaming_patch, reject_response, static_resp, stream_sse_response,
+    apply_non_streaming_patch, copy_upstream_headers, reject_response, static_resp,
+    stream_sse_response,
 };
 use crate::telemetry_sink::{finalize_turn, prepare_outbound, BoxBody};
 use crate::ui_api::{handle_ui_or_api, is_ui_or_api_path};
@@ -27,7 +31,7 @@ use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -51,8 +55,8 @@ impl ProxyState {
         let t = UpstreamTargets {
             openai,
             anthropic,
-            gemini: "https://generativelanguage.googleapis.com".to_owned(),
-            ollama: "http://127.0.0.1:11434".to_owned(),
+            gemini: DEFAULT_GEMINI_BASE.to_owned(),
+            ollama: DEFAULT_OLLAMA_BASE.to_owned(),
         };
         Self::with_config(t, PublicConfig::default(), audit)
     }
@@ -64,13 +68,18 @@ impl ProxyState {
         public_cfg: PublicConfig,
         audit: Option<Mutex<AuditLedger>>,
     ) -> Self {
-        let (events_tx, _) = broadcast::channel(256);
+        let (events_tx, _) = broadcast::channel(GatewayConfig::env_events_cap());
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             targets,
             public_cfg,
             limiter: SlidingWindowLimiter::default(),
             metrics: MetricsRegistry::default(),
-            client: Client::new(),
+            client,
             session: Mutex::new(SessionState::default()),
             summary: Mutex::new(SessionCostSummary::default()),
             audit,
@@ -112,18 +121,10 @@ async fn handle_request(
     let headers = req.headers().clone();
 
     if method == hyper::Method::GET && path_and_query == "/health" {
-        return Ok(static_resp(
-            StatusCode::OK,
-            "application/json",
-            render_health_json(state.public_cfg.public_mode),
-        ));
+        return Ok(static_resp(StatusCode::OK, "application/json", render_health_json(state.public_cfg.public_mode)));
     }
     if method == hyper::Method::GET && path_and_query == "/metrics" {
-        return Ok(static_resp(
-            StatusCode::OK,
-            "text/plain; version=0.0.4",
-            state.metrics.render_prometheus(),
-        ));
+        return Ok(static_resp(StatusCode::OK, "text/plain; version=0.0.4", state.metrics.render_prometheus()));
     }
     if is_ui_or_api_path(&path_and_query) {
         let body = if method == hyper::Method::POST {
@@ -144,23 +145,16 @@ async fn handle_request(
         }
     }
 
-    let raw_bytes = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(static_resp(StatusCode::BAD_REQUEST, "text/plain", "failed reading body".to_owned())),
+    let Ok(collected) = req.into_body().collect().await else {
+        return Ok(static_resp(StatusCode::BAD_REQUEST, "text/plain", "failed reading body".to_owned()));
     };
-    if raw_bytes.len() > state.public_cfg.max_body_bytes {
+    let raw_bytes = collected.to_bytes();
+    let Some(decoded_body) = decode_incoming_body_bounded(&headers, &raw_bytes, state.public_cfg.max_body_bytes) else {
         return Ok(static_resp(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body exceeds max limit".to_owned()));
-    }
+    };
 
-    let decoded_body = decode_incoming_body(&headers, &raw_bytes);
     let body_json = serde_json::from_slice::<serde_json::Value>(&decoded_body).ok();
-    let route = match AutoRouter::resolve(
-        &headers,
-        &path_and_query,
-        body_json.as_ref(),
-        &state.targets,
-        state.public_cfg.public_mode,
-    ) {
+    let route = match AutoRouter::resolve(&headers, &path_and_query, body_json.as_ref(), &state.targets, state.public_cfg.public_mode) {
         Ok(r) => r,
         Err(rej) => return Ok(reject_response(rej, &state)),
     };
@@ -183,28 +177,16 @@ async fn handle_request(
 
     let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let body_len = outbound_body.len();
-    let upstream_req = apply_proxy_headers(
-        state.client.request(req_method, &route.target_url),
-        &headers,
-        body_len,
-    )
-    .body(outbound_body);
+    let upstream_req = apply_proxy_headers(state.client.request(req_method, &route.target_url), &headers, body_len).body(outbound_body);
 
-    let upstream_res = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("[aphelion] upstream connection error: {err}");
-            return Ok(static_resp(StatusCode::BAD_GATEWAY, "text/plain", format!("upstream error: {err}")));
-        }
+    let Ok(upstream_res) = upstream_req.send().await else {
+        eprintln!("[aphelion] upstream connection error on {}", redact_path_query(&path_and_query));
+        return Ok(static_resp(StatusCode::BAD_GATEWAY, "text/plain", "upstream connection failed".to_owned()));
     };
 
     let status = StatusCode::from_u16(upstream_res.status().as_u16()).unwrap_or(StatusCode::OK);
-    let content_type = upstream_res
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_owned();
+    let upstream_headers = upstream_res.headers().clone();
+    let content_type = upstream_headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/json").to_owned();
 
     if !status.is_success() {
         let err_bytes = upstream_res.bytes().await.unwrap_or_default();
@@ -212,10 +194,8 @@ async fn handle_request(
             let ms = (turn.started_at.elapsed().as_millis() as u64).max(1);
             finalize_turn(&state, turn, None, status.as_u16(), ms, ms);
         }
-        eprintln!("[aphelion] upstream HTTP {} on {path_and_query}", status.as_u16());
-        return Ok(Response::builder()
-            .status(status)
-            .header("content-type", content_type)
+        eprintln!("[aphelion] upstream HTTP {} on {}", status.as_u16(), redact_path_query(&path_and_query));
+        return Ok(copy_upstream_headers(Response::builder().status(status).header("content-type", content_type), &upstream_headers)
             .body(BoxBody::new(Full::new(err_bytes)))
             .expect("error response"));
     }
@@ -238,10 +218,6 @@ async fn handle_request(
         }
     }
     let len = bytes.len();
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .header("content-length", len.to_string())
-        .body(BoxBody::new(Full::new(Bytes::from(bytes))))
-        .expect("json response"))
+    let builder = Response::builder().status(status).header("content-type", content_type).header("content-length", len.to_string());
+    Ok(copy_upstream_headers(builder, &upstream_headers).body(BoxBody::new(Full::new(Bytes::from(bytes)))).expect("json response"))
 }

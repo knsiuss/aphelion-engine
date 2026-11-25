@@ -1,3 +1,5 @@
+pub use crate::ingress_anthropic::has_cache_control;
+use crate::ingress_anthropic::{find_last_cache_control_end, find_last_cached_msg_idx};
 use crate::types::{
     Complexity, Dialect, NormalizedRequest, SessionState, SlmRouteDecision, StageStats,
     WorkloadClass,
@@ -22,22 +24,52 @@ pub fn normalize(
         return Ok(passthrough_ir(raw_json));
     }
 
-    let sacred_boundary = scan_cache_control_boundary(raw_json, &root);
-    let is_turn_zero = state.session_id.is_none() || state.turn_index == 0;
-    let session_id = derive_two_phase_session(&root, dialect, state);
-    state.session_id = Some(session_id);
-
-    let active_tool_loop = detect_active_tool_loop(&root, dialect);
-    let workload = classify_workload(dialect, &root, active_tool_loop);
+    let system_has_cache_control = root.get("system").map(has_cache_control).unwrap_or(false)
+        || root.get("tools").map(has_cache_control).unwrap_or(false);
+    let last_cached_msg_idx = find_last_cached_msg_idx(&root);
+    let sacred_boundary = if system_has_cache_control || last_cached_msg_idx.is_some() {
+        find_last_cache_control_end(raw_json)
+    } else {
+        0
+    };
     let model = root
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    state.active_model = model.clone();
+    let derived_id = derive_two_phase_session(&root, dialect, state);
+    let model_changed = !state.active_model.is_empty() && state.active_model != model;
+    let session_changed = state.session_id.is_some_and(|prev| prev != derived_id);
+    if session_changed || model_changed {
+        state.session_id = Some(derived_id);
+        state.active_model = model.clone();
+        let key = state.ledger_key(&model);
+        if let Some(rec) = state.prefix_ledger.get(&key) {
+            state.frozen_prefix_bytes = rec.frozen_prefix_bytes.clone();
+            state.frozen_prefix_len = rec.frozen_prefix_bytes.len();
+        } else {
+            state.frozen_prefix_bytes.clear();
+            state.frozen_prefix_len = 0;
+            state.sacred_cache_boundary = 0;
+            state.system_has_cache_control = false;
+            state.last_cached_msg_idx = None;
+        }
+    } else {
+        state.session_id = Some(derived_id);
+        state.active_model = model.clone();
+    }
+    let key_now = state.ledger_key(&model);
+    let has_committed = state
+        .prefix_ledger
+        .get(&key_now)
+        .is_some_and(|r| r.committed_len > 0 || !r.frozen_prefix_bytes.is_empty());
+    let is_turn_zero = !has_committed && (state.turn_index == 0 || session_changed || model_changed);
     let supports_prefill = model_supports_prefill(&model);
     let supports_vision = model_supports_vision(&model);
     let pre_compaction_messages = root.get("messages").cloned();
+
+    let active_tool_loop = detect_active_tool_loop(&root, dialect);
+    let workload = classify_workload(dialect, &root, active_tool_loop);
 
     Ok(NormalizedRequest {
         dialect,
@@ -46,6 +78,8 @@ pub fn normalize(
         root,
         raw_passthrough: None,
         sacred_boundary,
+        system_has_cache_control,
+        last_cached_msg_idx,
         is_turn_zero,
         ingress_start: 0,
         active_tool_loop,
@@ -68,6 +102,8 @@ fn passthrough_ir(raw: &[u8]) -> NormalizedRequest {
         root: Value::Null,
         raw_passthrough: Some(raw.to_vec()),
         sacred_boundary: 0,
+        system_has_cache_control: false,
+        last_cached_msg_idx: None,
         is_turn_zero: false,
         ingress_start: 0,
         active_tool_loop: false,
@@ -82,34 +118,41 @@ fn passthrough_ir(raw: &[u8]) -> NormalizedRequest {
     }
 }
 
-fn scan_cache_control_boundary(raw_json: &[u8], root: &Value) -> usize {
-    let needle = b"cache_control";
-    if let Some(pos) = raw_json.windows(needle.len()).rposition(|w| w == needle) {
-        let sys_len = root.get("system").map(|v| v.to_string().len()).unwrap_or(0);
-        let tools_len = root.get("tools").map(|v| v.to_string().len()).unwrap_or(0);
-        pos.saturating_add(needle.len())
-            .max(sys_len.saturating_add(tools_len))
-    } else {
-        0
-    }
-}
-
 fn derive_two_phase_session(root: &Value, dialect: Dialect, state: &mut SessionState) -> u128 {
     let messages = root.get("messages").and_then(Value::as_array);
-    if let Some(existing) = state.session_id {
-        if state.turn_alias.is_none() {
-            if let Some(msgs) = messages {
-                if let Some(first_asst) = msgs
-                    .iter()
-                    .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                {
-                    let slice = first_asst.to_string();
-                    state.turn_alias = Some(xxh3_64(&slice.as_bytes()[..slice.len().min(256)]));
-                }
+    if state.turn_alias.is_none() {
+        if let Some(msgs) = messages {
+            if let Some(first_asst) = msgs
+                .iter()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            {
+                let slice = first_asst.to_string();
+                state.turn_alias = Some(xxh3_64(&slice.as_bytes()[..slice.len().min(256)]));
             }
         }
-        return existing;
     }
+
+    let first_user = messages
+        .and_then(|msgs| {
+            msgs.iter()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .and_then(|m| {
+                    m.get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| m.get("content").map(Value::to_string))
+                })
+        })
+        .or_else(|| {
+            root.get("input")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|m| m.get("content").map(Value::to_string))
+        })
+        .or_else(|| root.get("input").map(Value::to_string))
+        .or_else(|| root.get("contents").map(Value::to_string))
+        .or_else(|| root.get("prompt").map(Value::to_string))
+        .unwrap_or_default();
 
     let sys = match dialect {
         Dialect::OpenAiResponses => root.get("instructions"),
@@ -118,22 +161,10 @@ fn derive_two_phase_session(root: &Value, dialect: Dialect, state: &mut SessionS
     }
     .map(Value::to_string)
     .unwrap_or_default();
-
-    let first_user = messages
-        .and_then(|msgs| {
-            msgs.iter()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .map(Value::to_string)
-        })
-        .or_else(|| root.get("input").map(Value::to_string))
-        .or_else(|| root.get("contents").map(Value::to_string))
-        .or_else(|| root.get("prompt").map(Value::to_string))
-        .unwrap_or_default();
-
     let workspace_fp = extract_workspace_fingerprint(&sys, &first_user);
     let end = first_user.len().min(512);
-    let mut seed = Vec::with_capacity(sys.len() + workspace_fp.len() + end + 2);
-    seed.extend_from_slice(sys.as_bytes());
+    let mut seed = Vec::with_capacity(workspace_fp.len() + end + 20);
+    seed.extend_from_slice(&state.request_options.tenant_hash.to_le_bytes());
     seed.push(b'|');
     seed.extend_from_slice(workspace_fp.as_bytes());
     seed.push(b'|');

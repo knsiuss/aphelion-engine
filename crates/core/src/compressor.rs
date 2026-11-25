@@ -9,14 +9,12 @@ use serde_json::Value;
 pub fn compress_masked_prose(
     ir: &mut NormalizedRequest,
     profile: ExecutionProfile,
-    state: &SessionState,
+    _state: &SessionState,
 ) {
-    if state.sacred_cache_boundary > 0 && !ir.is_turn_zero {
-        return;
-    }
+    let min_mutable = ir.mutable_ingress_start();
     let saved = match ir.dialect {
         Dialect::OpenAiChat | Dialect::AnthropicMessages | Dialect::OllamaNative => {
-            compress_chat_or_prompt(&mut ir.root, profile)
+            compress_chat_or_prompt(&mut ir.root, profile, min_mutable)
         }
         Dialect::OpenAiResponses => compress_responses_input(&mut ir.root, profile),
         Dialect::GeminiGenerate => compress_gemini_contents(&mut ir.root, profile),
@@ -25,7 +23,7 @@ pub fn compress_masked_prose(
     ir.stage_stats.prose_pruned_tokens += saved;
 }
 
-fn compress_chat_or_prompt(root: &mut Value, profile: ExecutionProfile) -> usize {
+fn compress_chat_or_prompt(root: &mut Value, profile: ExecutionProfile, min_mutable: usize) -> usize {
     if let Some(prompt) = root
         .get("prompt")
         .and_then(Value::as_str)
@@ -37,11 +35,13 @@ fn compress_chat_or_prompt(root: &mut Value, profile: ExecutionProfile) -> usize
         }
         return 0;
     }
-    let Some(last) = root
-        .get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .and_then(|m| m.last_mut())
-    else {
+    let Some(msgs) = root.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    if msgs.len() <= min_mutable {
+        return 0;
+    }
+    let Some(last) = msgs.last_mut() else {
         return 0;
     };
     if last.get("role").and_then(Value::as_str) != Some("user") {
@@ -61,6 +61,9 @@ fn compress_chat_or_prompt(root: &mut Value, profile: ExecutionProfile) -> usize
     let mut total_saved = 0usize;
     if let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut) {
         for block in blocks {
+            if block.get("cache_control").is_some_and(|v| !v.is_null()) {
+                continue;
+            }
             if block.get("type").and_then(Value::as_str) == Some("text") {
                 if let Some(t) = block.get("text").and_then(Value::as_str).map(str::to_owned) {
                     if let Some((out, saved)) = try_compress_text(&t, profile) {

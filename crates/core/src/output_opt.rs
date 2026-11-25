@@ -3,18 +3,22 @@ use serde_json::{json, Value};
 
 const CONCISE_OUTPUT_DIRECTIVE: &str = "\n[Output Policy: Emit direct code, diffs, and tool calls without conversational preamble, post-code recaps, or restating the prompt; preserve 100% code completeness.]";
 
-/// Turn-0 Pre-Freeze Output Steering:
-/// Executes EXCLUSIVELY on Turn 0 BEFORE `PrefixLedger` freezes the root system prefix,
-/// reducing 3x-5x output filler waste while preserving `S_prefix == 1.00` across all turns.
+/// Pre-Freeze Output Steering:
+/// For string `system`, executes on Turn 0 BEFORE `PrefixLedger` freezes the root prefix.
+/// For Anthropic array `system`, appends `[Output Policy: ...]` consistently on EVERY turn
+/// after existing cached blocks so `system` stays 100% byte-identical across Turn 0..N.
 pub fn inject_concise_output_directive(ir: &mut NormalizedRequest, opts: &RequestOptions) {
-    if !ir.is_turn_zero
-        || opts.output_verbose
-        || ir.sacred_boundary > 0
+    if opts.output_verbose
         || matches!(
             ir.workload,
             WorkloadClass::Passthrough | WorkloadClass::StructuredOutput
         )
     {
+        return;
+    }
+
+    let is_array_system = ir.root.get("system").is_some_and(Value::is_array);
+    if !ir.is_turn_zero && !is_array_system {
         return;
     }
 
@@ -28,6 +32,37 @@ pub fn inject_concise_output_directive(ir: &mut NormalizedRequest, opts: &Reques
             {
                 if !sys.contains("[Output Policy:") {
                     ir.root["system"] = Value::String(format!("{sys}{CONCISE_OUTPUT_DIRECTIVE}"));
+                }
+            } else if let Some(blocks) = ir.root.get_mut("system").and_then(Value::as_array_mut) {
+                let already_present = blocks.iter().any(|b| {
+                    b.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.contains("[Output Policy:"))
+                });
+                if !already_present {
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": CONCISE_OUTPUT_DIRECTIVE.trim_start()
+                    }));
+                }
+            } else if let Some(first_msg) = ir
+                .root
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .and_then(|m| m.first_mut())
+            {
+                let role = first_msg.get("role").and_then(Value::as_str).unwrap_or_default();
+                if matches!(role, "system" | "developer") {
+                    if let Some(content) = first_msg
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    {
+                        if !content.contains("[Output Policy:") {
+                            first_msg["content"] =
+                                Value::String(format!("{content}{CONCISE_OUTPUT_DIRECTIVE}"));
+                        }
+                    }
                 }
             }
         }

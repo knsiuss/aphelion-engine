@@ -1,13 +1,17 @@
+use crate::defaults::{
+    DEFAULT_CACHE_DROP_BREAKER_THRESHOLD, DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+    DEFAULT_MAX_LEDGER_SESSIONS,
+};
 use crate::diet_gc::estimate_calibrated_tokens;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 
-/// High watermark for amortized macro-compaction (120,000 BPE tokens).
-pub const MACRO_COMPACTION_WATERMARK_TOKENS: usize = 120_000;
+/// High watermark for amortized macro-compaction (from centralized `defaults`).
+pub const MACRO_COMPACTION_WATERMARK_TOKENS: usize = DEFAULT_COMPACTION_THRESHOLD_TOKENS;
 /// Minimum rolling cache-hit ratio on turns >= 3 before tripping `FrozenPrefixPass`.
-pub const CACHE_DROP_BREAKER_THRESHOLD: f64 = 0.70;
-const MAX_LEDGER_SESSIONS: usize = 512;
+pub const CACHE_DROP_BREAKER_THRESHOLD: f64 = DEFAULT_CACHE_DROP_BREAKER_THRESHOLD;
+const MAX_LEDGER_SESSIONS: usize = DEFAULT_MAX_LEDGER_SESSIONS;
 
 /// Cryptographically tenant-isolated ledger key: `(tenant_hash, session_root_hash, provider_id, model_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,19 +122,97 @@ impl PrefixLedger {
 }
 
 /// Replays strictly frozen historical messages `0..k` verbatim into `messages`,
-/// returning `ingress_start = k`.
+/// verifying role and user-prompt prefix continuity so client history edits/rewinds
+/// fork cleanly at the divergence index instead of overwriting user edits.
 pub fn replay_frozen_history(messages: &mut [Value], record: &FrozenSessionRecord) -> usize {
     let k = record.committed_len.min(record.frozen_messages.len());
-    if k == 0 || messages.len() < k {
+    if k == 0 || messages.is_empty() {
         return 0;
     }
-    for (slot, frozen) in messages[..k]
-        .iter_mut()
-        .zip(record.frozen_messages[..k].iter())
-    {
-        *slot = frozen.clone();
+    let has_checkpoint = record.compaction_epoch > 0
+        || record
+            .frozen_messages
+            .get(1)
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("[APHELION_CHECKPOINT"));
+    if has_checkpoint && messages.len() >= k {
+        for (slot, frozen) in messages[..k].iter_mut().zip(record.frozen_messages[..k].iter()) {
+            let mut merged = frozen.clone();
+            sync_incoming_cache_control(slot, &mut merged);
+            *slot = merged;
+        }
+        return k;
     }
-    k
+
+    let limit = k.min(messages.len());
+    let mut matched = 0usize;
+    for (i, (inc, frz)) in messages[..limit]
+        .iter()
+        .zip(record.frozen_messages[..limit].iter())
+        .enumerate()
+    {
+        if !message_slot_compatible(inc, frz) {
+            break;
+        }
+        matched = i + 1;
+    }
+    for (slot, frozen) in messages[..matched]
+        .iter_mut()
+        .zip(record.frozen_messages[..matched].iter())
+    {
+        let mut merged = frozen.clone();
+        sync_incoming_cache_control(slot, &mut merged);
+        *slot = merged;
+    }
+    matched
+}
+
+/// Mirrors incoming `cache_control` markers onto the replayed frozen message (preserving
+/// newly placed sliding breakpoints and removing retired ones so total stays <= 4).
+fn sync_incoming_cache_control(incoming: &Value, target: &mut Value) {
+    match (incoming, target) {
+        (Value::Object(in_map), Value::Object(tgt_map)) => {
+            match in_map.get("cache_control") {
+                Some(cc) if !cc.is_null() => {
+                    tgt_map.insert("cache_control".to_owned(), cc.clone());
+                }
+                _ => {
+                    tgt_map.remove("cache_control");
+                }
+            }
+            if let (Some(in_c), Some(tgt_c)) = (in_map.get("content"), tgt_map.get_mut("content")) {
+                sync_incoming_cache_control(in_c, tgt_c);
+            }
+        }
+        (Value::Array(in_arr), Value::Array(tgt_arr)) => {
+            for (in_item, tgt_item) in in_arr.iter().zip(tgt_arr.iter_mut()) {
+                sync_incoming_cache_control(in_item, tgt_item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn message_slot_compatible(incoming: &Value, frozen: &Value) -> bool {
+    let inc_role = incoming.get("role").or_else(|| incoming.get("type")).and_then(Value::as_str);
+    let frz_role = frozen.get("role").or_else(|| frozen.get("type")).and_then(Value::as_str);
+    if inc_role != frz_role {
+        return false;
+    }
+    if inc_role == Some("user") {
+        if let (Some(ic), Some(fc)) = (
+            incoming.get("content").and_then(Value::as_str),
+            frozen.get("content").and_then(Value::as_str),
+        ) {
+            let ic_head = ic.trim().chars().take(16).collect::<String>();
+            let fc_head = fc.trim().chars().take(16).collect::<String>();
+            if !ic_head.is_empty() && !fc_head.is_empty() && ic_head != fc_head {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn commit_outbound_messages(messages: &[Value], record: &mut FrozenSessionRecord) {

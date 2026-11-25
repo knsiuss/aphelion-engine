@@ -63,7 +63,7 @@ pub fn estimate_calibrated_tokens(text: &str) -> usize {
 /// upstream KV-caches are never invalidated mid-trajectory. Only runs a compaction checkpoint
 /// when total context >= 120,000 BPE tokens AND `re_prefill_tokens * 10 < projected_saved_reads`.
 pub fn compact_if_amortized(ir: &mut NormalizedRequest, state: &SessionState) {
-    if ir.is_turn_zero || state.sacred_cache_boundary > 0 {
+    if ir.is_turn_zero {
         return;
     }
     let key = state.ledger_key(&ir.model_id);
@@ -89,7 +89,7 @@ pub fn compact_if_amortized(ir: &mut NormalizedRequest, state: &SessionState) {
     let mut candidates: Vec<(usize, &'static str, usize)> = Vec::new();
 
     for (idx, msg) in messages[..last_idx].iter().enumerate() {
-        if pinned_indices.contains(&idx) {
+        if pinned_indices.contains(&idx) || ir.last_cached_msg_idx.is_some_and(|c| idx <= c) {
             continue;
         }
         if msg.get("role").and_then(Value::as_str) != Some("tool") {

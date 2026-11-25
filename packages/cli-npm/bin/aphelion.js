@@ -37,7 +37,13 @@ function main() {
   const prebuilt = resolvePrebuiltBinary();
 
   if (prebuilt) {
+    if (process.platform !== "win32") {
+      try { fs.chmodSync(prebuilt, 0o755); } catch {}
+    }
     const res = spawnSync(prebuilt, args, { stdio: "inherit" });
+    if (res.signal) {
+      process.exit(130);
+    }
     process.exit(res.status ?? (res.error ? 1 : 0));
   }
 

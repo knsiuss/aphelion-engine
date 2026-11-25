@@ -52,7 +52,12 @@ impl MetricsRegistry {
         let Ok(mut map) = self.entries.lock() else {
             return;
         };
-        let entry = map.entry((prov, mdl)).or_default();
+        let key = if map.len() >= 256 && !map.contains_key(&(prov.clone(), mdl.clone())) {
+            ("other".to_owned(), "other".to_owned())
+        } else {
+            (prov, mdl)
+        };
+        let entry = map.entry(key).or_default();
         match status_code {
             200..=299 => entry.req_2xx += 1,
             400..=499 => entry.req_4xx += 1,

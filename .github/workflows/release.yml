@@ -99,5 +99,11 @@ jobs:
           fi
           mkdir -p packages/cli-npm/bin/native
           cp dist/* packages/cli-npm/bin/native/
-          npm publish --access public ./packages/cli-npm
-          npm publish --access public ./packages/middleware-js
+          chmod +x packages/cli-npm/bin/native/* packages/cli-npm/bin/aphelion.js
+          VER=$(node -p "require('./packages/cli-npm/package.json').version")
+          if ! npm view "aphelion-engine@${VER}" version >/dev/null 2>&1; then
+            npm publish --access public ./packages/cli-npm
+          fi
+          if ! npm view "aphelion-engine-middleware@${VER}" version >/dev/null 2>&1; then
+            npm publish --access public ./packages/middleware-js
+          fi

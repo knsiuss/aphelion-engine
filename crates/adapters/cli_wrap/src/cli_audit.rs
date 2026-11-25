@@ -77,10 +77,11 @@ pub fn print_summary(summary: &SessionCostSummary) {
 }
 
 pub fn print_usage() {
+    use crate::config::{DEFAULT_GATEWAY_PORT, DEFAULT_MAX_BODY_MB, DEFAULT_RPM_LIMIT};
     eprintln!("Usage:");
     eprintln!("  aphelion [--audit] [--port <u16>] [--upstream <url>] <command> [args...]");
-    eprintln!("  aphelion serve [--public] [--admin-token <secret>] [--bind <addr>] [--port 18787] [--rpm 120] [--max-body-mb 10] [--audit]");
-    eprintln!("  aphelion ui [--port 18787]");
+    eprintln!("  aphelion serve [--public] [--admin-token <secret>] [--bind <addr>] [--port {DEFAULT_GATEWAY_PORT}] [--rpm {DEFAULT_RPM_LIMIT}] [--max-body-mb {DEFAULT_MAX_BODY_MB}] [--audit]");
+    eprintln!("  aphelion ui [--port {DEFAULT_GATEWAY_PORT}]");
     eprintln!("  aphelion top [--interval <secs>] [--db <path>]");
     eprintln!("  aphelion doctor");
     eprintln!("  aphelion --audit-summary [--provider <name>] [--model <sub >] [--last <1h|24h|7d>]");

@@ -6,7 +6,7 @@ use crate::ui_queries::{build_overview_json, build_topology_json};
 use crate::ui_state::PolicyPatch;
 use bytes::Bytes;
 use futures_util::stream;
-use http_body_util::StreamBody;
+use http_body_util::{Full, StreamBody};
 use hyper::body::Frame;
 use hyper::{HeaderMap, Method, Response, StatusCode};
 use std::convert::Infallible;
@@ -19,6 +19,7 @@ const UI_CSS: &str = include_str!("../ui/styles.css");
 const UI_APP_JS: &str = include_str!("../ui/app.js");
 const UI_TOPO_JS: &str = include_str!("../ui/topology.js");
 const UI_CHARTS_JS: &str = include_str!("../ui/charts.js");
+const UI_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:";
 
 pub fn is_ui_or_api_path(path_and_query: &str) -> bool {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
@@ -28,6 +29,17 @@ pub fn is_ui_or_api_path(path_and_query: &str) -> bool {
             path,
             "/api/overview" | "/api/topology" | "/api/events" | "/api/policy"
         )
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn check_ui_access(
@@ -42,14 +54,18 @@ pub fn check_ui_access(
         return Err(StatusCode::NOT_FOUND);
     };
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if auth.strip_prefix("Bearer ").map(str::trim) == Some(secret.as_str()) {
-            return Ok(());
+        let trimmed = auth.trim();
+        if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+            let candidate = trimmed[7..].trim();
+            if constant_time_eq(candidate.as_bytes(), secret.as_bytes()) {
+                return Ok(());
+            }
         }
     }
     if let Some(query) = path_and_query.split_once('?').map(|(_, q)| q) {
         for pair in query.split('&') {
             if let Some(tok) = pair.strip_prefix("token=") {
-                if tok == secret {
+                if constant_time_eq(tok.as_bytes(), secret.as_bytes()) {
                     return Ok(());
                 }
             }
@@ -76,9 +92,12 @@ pub fn handle_ui_or_api(
 
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     match (method, path) {
-        (&Method::GET, "/ui" | "/ui/") => {
-            static_resp(StatusCode::OK, "text/html; charset=utf-8", UI_HTML.to_owned())
-        }
+        (&Method::GET, "/ui" | "/ui/") => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html; charset=utf-8")
+            .header("content-security-policy", UI_CSP)
+            .body(BoxBody::new(Full::new(Bytes::from(UI_HTML))))
+            .unwrap_or_else(|_| static_resp(StatusCode::OK, "text/html", UI_HTML.to_owned())),
         (&Method::GET, "/ui/styles.css") => {
             static_resp(StatusCode::OK, "text/css; charset=utf-8", UI_CSS.to_owned())
         }
@@ -104,7 +123,7 @@ pub fn handle_ui_or_api(
             static_resp(StatusCode::OK, "application/json", build_topology_json(&state))
         }
         (&Method::GET, "/api/events") => stream_events_sse(state),
-        (&Method::POST, "/api/policy") => handle_policy_update(body, &state),
+        (&Method::POST, "/api/policy") => handle_policy_update(headers, body, &state),
         _ => static_resp(
             StatusCode::NOT_FOUND,
             "application/json",
@@ -113,7 +132,16 @@ pub fn handle_ui_or_api(
     }
 }
 
-fn handle_policy_update(body: &[u8], state: &ProxyState) -> Response<BoxBody> {
+fn handle_policy_update(headers: &HeaderMap, body: &[u8], state: &ProxyState) -> Response<BoxBody> {
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !origin.contains("127.0.0.1") && !origin.contains("localhost") && !state.public_cfg.public_mode {
+            return static_resp(
+                StatusCode::FORBIDDEN,
+                "application/json",
+                r#"{"error":"cross-origin policy mutation forbidden"}"#.to_owned(),
+            );
+        }
+    }
     let Ok(patch) = serde_json::from_slice::<PolicyPatch>(body) else {
         return static_resp(
             StatusCode::BAD_REQUEST,

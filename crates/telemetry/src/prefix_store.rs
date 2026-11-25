@@ -1,6 +1,7 @@
 use aphelion_core::prefix_ledger::{FrozenSessionRecord, LedgerKey};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditSummary {
@@ -46,6 +47,20 @@ impl AuditSummary {
     }
 }
 
+/// Zero-Retention persisted metadata for `prefix_ledger`: stores ONLY cryptographic
+/// file hashes (`XXH3_64`), lengths, and rolling cache counters — never raw prompt or file text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedPrefixMeta {
+    frozen_file_hashes: HashMap<String, u64>,
+    committed_len: usize,
+    compaction_epoch: u32,
+    rolling_cached_read: usize,
+    rolling_total_input: usize,
+    usage_turns: usize,
+    upstream_supports_cache: bool,
+    cache_drop_breaker_tripped: bool,
+}
+
 pub fn init_prefix_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS prefix_ledger (
@@ -71,7 +86,17 @@ pub fn save_record(
     key: &LedgerKey,
     record: &FrozenSessionRecord,
 ) -> Result<(), rusqlite::Error> {
-    let json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_owned());
+    let meta = PersistedPrefixMeta {
+        frozen_file_hashes: record.frozen_file_hashes.clone(),
+        committed_len: record.committed_len,
+        compaction_epoch: record.compaction_epoch,
+        rolling_cached_read: record.rolling_cached_read,
+        rolling_total_input: record.rolling_total_input,
+        usage_turns: record.usage_turns,
+        upstream_supports_cache: record.upstream_supports_cache,
+        cache_drop_breaker_tripped: record.cache_drop_breaker_tripped,
+    };
+    let json = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_owned());
     let skey = composite_session_key(key);
     conn.execute(
         "INSERT INTO prefix_ledger (session_root_hash, model_id, committed_len, record_json)
@@ -95,5 +120,17 @@ pub fn load_record(conn: &Connection, key: &LedgerKey) -> Option<FrozenSessionRe
     let json_str: String = stmt
         .query_row(params![skey, key.model_id], |row| row.get(0))
         .ok()?;
-    serde_json::from_str(&json_str).ok()
+    let meta: PersistedPrefixMeta = serde_json::from_str(&json_str).ok()?;
+    Some(FrozenSessionRecord {
+        frozen_prefix_bytes: Vec::new(),
+        frozen_messages: Vec::new(),
+        frozen_file_hashes: meta.frozen_file_hashes,
+        committed_len: meta.committed_len,
+        compaction_epoch: meta.compaction_epoch,
+        rolling_cached_read: meta.rolling_cached_read,
+        rolling_total_input: meta.rolling_total_input,
+        usage_turns: meta.usage_turns,
+        upstream_supports_cache: meta.upstream_supports_cache,
+        cache_drop_breaker_tripped: meta.cache_drop_breaker_tripped,
+    })
 }

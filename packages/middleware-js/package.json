@@ -1,6 +1,6 @@
 {
   "name": "aphelion-engine-middleware",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "In-process LongLived router middleware for Aphelion (9Router, LiteLLM, Node fetch pipelines)",
   "license": "MIT",
   "repository": {

@@ -96,12 +96,19 @@ pub struct TopologyTracker {
 
 impl TopologyTracker {
     pub fn record(&mut self, ev: TelemetryEvent) {
-        *self.clients.entry(ev.client.clone()).or_insert(0) += 1;
+        if self.clients.len() < 128 || self.clients.contains_key(&ev.client) {
+            *self.clients.entry(ev.client.clone()).or_insert(0) += 1;
+        }
+        let up_key = if self.upstreams.len() >= 128 && !self.upstreams.contains_key(&ev.provider) {
+            "other".to_owned()
+        } else {
+            ev.provider.clone()
+        };
         let node = self
             .upstreams
-            .entry(ev.provider.clone())
+            .entry(up_key.clone())
             .or_insert_with(|| UpstreamHealthNode {
-                label: ev.provider.clone(),
+                label: up_key,
                 health: "healthy".to_owned(),
                 avg_ttft_ms: ev.ttft_ms,
                 req_count: 0,

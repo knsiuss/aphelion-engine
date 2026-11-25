@@ -1,4 +1,5 @@
 use crate::audit_report::{format_tokens, render_provider_model_table, truncate_str};
+use crate::config::DEFAULT_TOP_INTERVAL_SECS;
 use aphelion_core::flight_recorder::{AuditFilter, ProviderModelStats};
 use aphelion_telemetry::audit::{AuditLedger, AuditRecord, AuditSummary};
 use std::env;
@@ -109,7 +110,7 @@ pub fn build_top_frame(
 }
 
 fn parse_top_args(args: &[String], default_db: &str) -> (u64, String) {
-    let mut interval = 1u64;
+    let mut interval = DEFAULT_TOP_INTERVAL_SECS;
     let mut db = default_db.to_owned();
     let mut i = 0;
     while i < args.len() {

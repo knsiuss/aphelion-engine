@@ -58,6 +58,9 @@ pub struct RequestOptions {
     pub output_verbose: bool,
     pub reasoning_effort: Option<String>,
     pub compact_mode: CompactMode,
+    pub compaction_threshold_tokens: Option<usize>,
+    pub locked_tail_messages: Option<usize>,
+    pub slm_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +154,8 @@ pub struct SessionState {
     pub frozen_prefix_len: usize,
     pub frozen_prefix_bytes: Vec<u8>,
     pub sacred_cache_boundary: usize,
+    pub system_has_cache_control: bool,
+    pub last_cached_msg_idx: Option<usize>,
     pub last_thought_anchor: Option<String>,
     pub last_usage: Option<UpstreamUsage>,
     pub known_blocks: HashMap<String, BlockSpan>,
@@ -192,6 +197,8 @@ pub struct NormalizedRequest {
     pub root: Value,
     pub raw_passthrough: Option<Vec<u8>>,
     pub sacred_boundary: usize,
+    pub system_has_cache_control: bool,
+    pub last_cached_msg_idx: Option<usize>,
     pub is_turn_zero: bool,
     pub ingress_start: usize,
     pub active_tool_loop: bool,
@@ -203,6 +210,20 @@ pub struct NormalizedRequest {
     pub slm_route: SlmRouteDecision,
     pub stage_stats: StageStats,
     pub pre_compaction_messages: Option<Value>,
+}
+
+impl NormalizedRequest {
+    /// First message index strictly after frozen ledger history.
+    /// On Turn-0 (when no prior committed boundary exists), respects `last_cached_msg_idx + 1`.
+    /// On Turn-N (`!is_turn_zero && ingress_start > 0`), messages at `>= ingress_start` are newly
+    /// appended and have never been dispatched upstream yet, even if they carry rolling `cache_control`.
+    pub fn mutable_ingress_start(&self) -> usize {
+        if !self.is_turn_zero && self.ingress_start > 0 {
+            return self.ingress_start;
+        }
+        let after_cache = self.last_cached_msg_idx.map(|i| i + 1).unwrap_or(0);
+        self.ingress_start.max(after_cache)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

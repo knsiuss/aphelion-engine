@@ -191,7 +191,7 @@ async fn public_mode_locks_down_ui_and_admin_token_enforces_401_and_200() {
             gemini: targets.gemini.clone(),
             ollama: targets.ollama.clone(),
         },
-        PublicConfig { public_mode: true, rpm_limit: 60, max_body_bytes: 1024 * 1024, admin_token: None },
+        PublicConfig { public_mode: true, rpm_limit: 60, max_body_bytes: 1024 * 1024, ..PublicConfig::default() },
         None,
     ));
     let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -210,6 +210,7 @@ async fn public_mode_locks_down_ui_and_admin_token_enforces_401_and_200() {
             rpm_limit: 60,
             max_body_bytes: 1024 * 1024,
             admin_token: Some("secret123".to_owned()),
+            ..PublicConfig::default()
         },
         None,
     ));

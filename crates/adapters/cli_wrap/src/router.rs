@@ -1,5 +1,8 @@
 use crate::headers::{join_base_path, UpstreamTargets};
-use crate::public_guard::{extract_raw_credential, validate_upstream_ssrf, GuardRejection};
+use crate::provider_registry::{resolve_provider_base, DEFAULT_OPENAI_BASE, PROVIDER_SPECS};
+use crate::public_guard::{
+    extract_raw_credential, ssrf_reject, validate_upstream_ssrf, GuardRejection,
+};
 use hyper::HeaderMap;
 use serde_json::Value;
 
@@ -9,11 +12,11 @@ pub struct ResolvedRoute {
     pub target_url: String,
 }
 
-/// Deterministic 4-Stage Zero-Config Auto-Router:
-/// 1. Explicit `X-Aphelion-Upstream` (with SSRF guard in `--public` mode) or path prefix.
-/// 2. Credential-shape auto-detection (in-memory only, never logged).
-/// 3. Model-ID pattern auto-detection (fallback for generic/local keys).
-/// 4. Wire-dialect path fallback.
+/// Deterministic 4-Stage Zero-Config Auto-Router backed by `PROVIDER_SPECS`:
+/// 1. Explicit `X-Aphelion-Upstream` (with SSRF guard) or strict `/provider/...` path prefix.
+/// 2. Unambiguous credential prefix (`sk-or-v1-`, `sk-ant-`, `sk-proj-`, `AIza`, `gsk_`, etc.).
+/// 3. Wire-dialect (`/v1/messages`, `anthropic-version`) & Model-ID disambiguation (resolving generic `sk-` collisions for DeepSeek, Moonshot, Qwen, GLM, Mistral, LiteLLM).
+/// 4. Generic `sk-` / dialect fallback + dynamic hostname label derivation.
 pub struct AutoRouter;
 
 impl AutoRouter {
@@ -47,27 +50,67 @@ impl AutoRouter {
             });
         }
 
-        // Stage 1b: Explicit provider path prefix
-        if let Some((provider, base, rest)) = match_path_prefix(path_and_query, targets) {
-            return Ok(ResolvedRoute {
-                provider_id: provider.to_owned(),
-                target_url: join_base_path(base, rest),
-            });
+        // Reject `@` authority injection attempts in path_and_query (e.g., `/ollama@169.254...`).
+        let path_only = path_and_query.split('?').next().unwrap_or(path_and_query);
+        if path_only.contains('@') {
+            return Err(ssrf_reject("Invalid `@` authority character in request path"));
         }
 
-        // Stage 2: Credential-shape auto-detection (in-memory only, never logged)
-        if let Some(token) = extract_raw_credential(headers) {
-            if let Some((provider, base)) = detect_provider_by_credential(token, targets) {
-                return Ok(ResolvedRoute {
-                    provider_id: provider.to_owned(),
-                    target_url: join_base_path(base, path_and_query),
-                });
+        // Stage 1b: Explicit provider path prefix (must be followed by `/`, `?`, or end-of-path)
+        for spec in PROVIDER_SPECS {
+            if let Some(rest) = path_and_query.strip_prefix(spec.path_prefix) {
+                if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') {
+                    if public_mode && spec.id == "ollama" {
+                        return Err(ssrf_reject("Local Ollama route is disabled in --public mode"));
+                    }
+                    let base = resolve_provider_base(spec, targets);
+                    return Ok(ResolvedRoute {
+                        provider_id: spec.id.to_owned(),
+                        target_url: join_base_path(&base, rest),
+                    });
+                }
             }
         }
 
-        // Stage 3: Model-ID pattern auto-detection (only when not pinned to a custom router/mock)
-        let is_default_openai = targets.openai.starts_with("https://api.openai.com");
-        if is_default_openai {
+        // Stage 2: Unambiguous credential-shape auto-detection (in-memory only, never logged)
+        let raw_token = extract_raw_credential(headers);
+        if let Some(token) = raw_token {
+            for spec in PROVIDER_SPECS {
+                if spec.key_prefixes.iter().any(|p| token.starts_with(p)) {
+                    let base = resolve_provider_base(spec, targets);
+                    return Ok(ResolvedRoute {
+                        provider_id: spec.id.to_owned(),
+                        target_url: join_base_path(&base, path_and_query),
+                    });
+                }
+            }
+        }
+
+        // Stage 3a: Anthropic wire-dialect priority (handles LiteLLM `sk-...` virtual keys on `/v1/messages` & `/api/hello`)
+        if path_only.contains("/messages") || headers.contains_key("anthropic-version") {
+            return Ok(ResolvedRoute {
+                provider_id: "anthropic".to_owned(),
+                target_url: join_base_path(&targets.anthropic, path_and_query),
+            });
+        }
+        if path_only.contains("generateContent") {
+            return Ok(ResolvedRoute {
+                provider_id: "gemini".to_owned(),
+                target_url: join_base_path(&targets.gemini, path_and_query),
+            });
+        }
+        if is_ollama_api_path(path_only) {
+            if public_mode {
+                return Err(ssrf_reject("Local Ollama route is disabled in --public mode"));
+            }
+            return Ok(ResolvedRoute {
+                provider_id: "ollama".to_owned(),
+                target_url: join_base_path(&targets.ollama, path_and_query),
+            });
+        }
+
+        // Stage 3b: Model-ID disambiguation (disambiguates generic `sk-` keys across DeepSeek, Moonshot, Qwen, GLM, Mistral, Ollama)
+        if targets.openai.starts_with(DEFAULT_OPENAI_BASE) {
             let model = body_json
                 .and_then(|v| v.get("model"))
                 .and_then(Value::as_str)
@@ -75,123 +118,58 @@ impl AutoRouter {
             if let Some((provider, base)) = detect_provider_by_model(model, targets) {
                 return Ok(ResolvedRoute {
                     provider_id: provider.to_owned(),
-                    target_url: join_base_path(base, path_and_query),
+                    target_url: join_base_path(&base, path_and_query),
                 });
             }
         }
 
-        // Stage 4: Dialect path fallback
-        let (provider, base) = if path_and_query.contains("/messages") {
-            ("anthropic", targets.anthropic.as_str())
-        } else if path_and_query.contains("generateContent") {
-            ("gemini", targets.gemini.as_str())
-        } else if path_and_query.starts_with("/api/") {
-            ("ollama", targets.ollama.as_str())
+        // Stage 4: Generic `sk-` / OpenAI-compatible fallback
+        let label = if targets.openai.starts_with(DEFAULT_OPENAI_BASE) {
+            "openai".to_owned()
         } else {
-            ("openai", targets.openai.as_str())
+            derive_provider_label(&targets.openai)
         };
         Ok(ResolvedRoute {
-            provider_id: provider.to_owned(),
-            target_url: join_base_path(base, path_and_query),
+            provider_id: label,
+            target_url: join_base_path(&targets.openai, path_and_query),
         })
     }
 }
 
-fn match_path_prefix<'a>(
-    path: &'a str,
-    targets: &'a UpstreamTargets,
-) -> Option<(&'static str, &'a str, &'a str)> {
-    let table: &[(&str, &str, &str)] = &[
-        ("/openai", "openai", targets.openai.as_str()),
-        ("/anthropic", "anthropic", targets.anthropic.as_str()),
-        ("/gemini", "gemini", targets.gemini.as_str()),
-        ("/openrouter", "openrouter", "https://openrouter.ai/api/v1"),
-        ("/opencode", "opencode", targets.openai.as_str()),
-        ("/groq", "groq", "https://api.groq.com/openai/v1"),
-        ("/xai", "xai", "https://api.x.ai/v1"),
-        (
-            "/fireworks",
-            "fireworks",
-            "https://api.fireworks.ai/inference/v1",
-        ),
-        (
-            "/huggingface",
-            "huggingface",
-            "https://router.huggingface.co/v1",
-        ),
-        ("/cerebras", "cerebras", "https://api.cerebras.ai/v1"),
-        ("/perplexity", "perplexity", "https://api.perplexity.ai"),
-        ("/together", "together", "https://api.together.xyz/v1"),
-        ("/deepseek", "deepseek", "https://api.deepseek.com/v1"),
-        ("/mistral", "mistral", "https://api.mistral.ai/v1"),
-        ("/ollama", "ollama", targets.ollama.as_str()),
-    ];
-    for &(prefix, provider, base) in table {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            return Some((provider, base, rest));
-        }
-    }
-    None
+fn is_ollama_api_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/chat"
+            | "/api/generate"
+            | "/api/tags"
+            | "/api/embed"
+            | "/api/embeddings"
+            | "/api/show"
+            | "/api/ps"
+            | "/api/pull"
+            | "/api/version"
+    )
 }
 
-fn detect_provider_by_credential<'a>(
-    token: &str,
-    targets: &'a UpstreamTargets,
-) -> Option<(&'static str, &'a str)> {
-    if token.starts_with("sk-or-v1-") {
-        Some(("openrouter", "https://openrouter.ai/api/v1"))
-    } else if token.starts_with("sk-ant-") {
-        Some(("anthropic", targets.anthropic.as_str()))
-    } else if token.starts_with("AIza") {
-        Some(("gemini", targets.gemini.as_str()))
-    } else if token.starts_with("gsk_") {
-        Some(("groq", "https://api.groq.com/openai/v1"))
-    } else if token.starts_with("xai-") {
-        Some(("xai", "https://api.x.ai/v1"))
-    } else if token.starts_with("fw_") {
-        Some(("fireworks", "https://api.fireworks.ai/inference/v1"))
-    } else if token.starts_with("hf_") {
-        Some(("huggingface", "https://router.huggingface.co/v1"))
-    } else if token.starts_with("csk-") {
-        Some(("cerebras", "https://api.cerebras.ai/v1"))
-    } else if token.starts_with("pplx-") {
-        Some(("perplexity", "https://api.perplexity.ai"))
-    } else if token.starts_with("tgp_v1_") {
-        Some(("together", "https://api.together.xyz/v1"))
-    } else if token.starts_with("sk-proj-") || token.starts_with("sk-") {
-        Some(("openai", targets.openai.as_str()))
-    } else {
-        None
-    }
-}
-
-fn detect_provider_by_model<'a>(
-    model: &str,
-    targets: &'a UpstreamTargets,
-) -> Option<(&'static str, &'a str)> {
+fn detect_provider_by_model(model: &str, targets: &UpstreamTargets) -> Option<(&'static str, String)> {
     let m = model.trim().to_ascii_lowercase();
     if m.is_empty() {
         return None;
     }
-    if m.ends_with(":free") || m.starts_with("openrouter/") || m.starts_with("stealth/") {
-        Some(("openrouter", "https://openrouter.ai/api/v1"))
-    } else if m.starts_with("claude-") {
-        Some(("anthropic", targets.anthropic.as_str()))
-    } else if m.starts_with("gemini-") {
-        Some(("gemini", targets.gemini.as_str()))
-    } else if m.starts_with("grok-") {
-        Some(("xai", "https://api.x.ai/v1"))
-    } else if m.starts_with("sonar-") {
-        Some(("perplexity", "https://api.perplexity.ai"))
-    } else if m.starts_with("mistral-") || m.starts_with("devstral-") || m.starts_with("codestral-") {
-        Some(("mistral", "https://api.mistral.ai/v1"))
-    } else if m.starts_with("deepseek-") && !m.contains(':') {
-        Some(("deepseek", "https://api.deepseek.com/v1"))
-    } else if m.contains(':') {
-        Some(("ollama", targets.ollama.as_str()))
-    } else {
-        None
+    if m.ends_with(":free") {
+        let spec = PROVIDER_SPECS.iter().find(|s| s.id == "openrouter")?;
+        return Some((spec.id, resolve_provider_base(spec, targets)));
     }
+    if m.contains(':') {
+        let spec = PROVIDER_SPECS.iter().find(|s| s.id == "ollama")?;
+        return Some((spec.id, resolve_provider_base(spec, targets)));
+    }
+    for spec in PROVIDER_SPECS {
+        if spec.model_prefixes.iter().any(|p| m.starts_with(p)) {
+            return Some((spec.id, resolve_provider_base(spec, targets)));
+        }
+    }
+    None
 }
 
 /// Derives a clean, dynamic provider label from any custom URL:
@@ -204,7 +182,10 @@ pub fn derive_provider_label(url_str: &str) -> String {
     let Some(host) = parsed.host_str() else {
         return "custom".to_owned();
     };
-    let lower = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let lower = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     if matches!(lower.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0") {
         return match parsed.port() {
             Some(p) => format!("local:{p}"),

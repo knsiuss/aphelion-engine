@@ -12,11 +12,12 @@ const CELL_H: u32 = 10;
 /// Rasterizes archived non-code terminal/DOM logs into 1024x1024 monochrome PNG base64
 /// image blocks when `supports_vision == true` and non-code log tokens >= 6,000.
 /// Hard Invariant 5: NEVER rasterizes active source code files or fenced code blocks.
-pub fn rasterize_if_eligible(ir: &mut NormalizedRequest, state: &SessionState) {
-    if !ir.supports_vision || ir.is_turn_zero || state.sacred_cache_boundary > 0 {
+pub fn rasterize_if_eligible(ir: &mut NormalizedRequest, _state: &SessionState) {
+    if !ir.supports_vision || ir.is_turn_zero {
         return;
     }
     let dialect = ir.dialect;
+    let start_idx = ir.mutable_ingress_start();
     let Some(messages) = ir.root.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -24,7 +25,7 @@ pub fn rasterize_if_eligible(ir: &mut NormalizedRequest, state: &SessionState) {
         return;
     }
 
-    let start_idx = ir.ingress_start.min(messages.len());
+    let start_idx = start_idx.min(messages.len());
     if start_idx >= messages.len() {
         return;
     }

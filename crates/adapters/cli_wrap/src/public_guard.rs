@@ -1,10 +1,13 @@
+use crate::config::{DEFAULT_MAX_BODY_MB, DEFAULT_RPM_LIMIT};
 pub use crate::metrics::MetricsRegistry;
 use hyper::{HeaderMap, StatusCode};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
+
+const MAX_RATE_LIMIT_BUCKETS: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct PublicConfig {
@@ -12,15 +15,17 @@ pub struct PublicConfig {
     pub rpm_limit: u32,
     pub max_body_bytes: usize,
     pub admin_token: Option<String>,
+    pub allow_custom_upstream: bool,
 }
 
 impl Default for PublicConfig {
     fn default() -> Self {
         Self {
             public_mode: false,
-            rpm_limit: 120,
-            max_body_bytes: 10 * 1024 * 1024,
+            rpm_limit: DEFAULT_RPM_LIMIT,
+            max_body_bytes: DEFAULT_MAX_BODY_MB * 1024 * 1024,
             admin_token: None,
+            allow_custom_upstream: false,
         }
     }
 }
@@ -33,7 +38,7 @@ pub struct GuardRejection {
 }
 
 /// Extracts cryptographic `tenant_hash = XXH3_64(auth_token)` in memory only (never logged).
-/// In `--public` mode, missing `Authorization` / `x-api-key` returns `401 Unauthorized`.
+/// In `--public` mode, missing credential returns `401 Unauthorized`.
 pub fn extract_tenant_hash(headers: &HeaderMap, public_mode: bool) -> Result<u64, GuardRejection> {
     let raw = extract_raw_credential(headers);
     if !public_mode {
@@ -51,11 +56,12 @@ pub fn extract_tenant_hash(headers: &HeaderMap, public_mode: bool) -> Result<u64
 
 pub fn extract_raw_credential(headers: &HeaderMap) -> Option<&str> {
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        let stripped = auth
-            .strip_prefix("Bearer ")
-            .or_else(|| auth.strip_prefix("bearer "))
-            .unwrap_or(auth)
-            .trim();
+        let trimmed = auth.trim();
+        let stripped = if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+            trimmed[7..].trim()
+        } else {
+            trimmed
+        };
         if !stripped.is_empty() {
             return Some(stripped);
         }
@@ -63,12 +69,18 @@ pub fn extract_raw_credential(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-api-key")
         .or_else(|| headers.get("x-goog-api-key"))
+        .or_else(|| headers.get("api-key"))
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
 
-/// Per-tenant 60-second sliding-window rate limiter returning `429 Too Many Requests`.
+/// Strips query strings (`?key=...`) before logging paths to stderr.
+pub fn redact_path_query(path_and_query: &str) -> &str {
+    path_and_query.split('?').next().unwrap_or(path_and_query)
+}
+
+/// Per-tenant 60-second sliding-window rate limiter with bounded bucket count.
 #[derive(Default)]
 pub struct SlidingWindowLimiter {
     windows: Mutex<HashMap<u64, VecDeque<Instant>>>,
@@ -84,6 +96,14 @@ impl SlidingWindowLimiter {
         let Ok(mut map) = self.windows.lock() else {
             return Ok(());
         };
+        if map.len() >= MAX_RATE_LIMIT_BUCKETS && !map.contains_key(&tenant_hash) {
+            map.retain(|_, q| q.back().is_some_and(|&t| t >= cutoff));
+            if map.len() >= MAX_RATE_LIMIT_BUCKETS {
+                if let Some(&first_key) = map.keys().next() {
+                    map.remove(&first_key);
+                }
+            }
+        }
         let queue = map.entry(tenant_hash).or_default();
         while queue.front().is_some_and(|&t| t < cutoff) {
             queue.pop_front();
@@ -115,8 +135,8 @@ pub fn validate_upstream_ssrf(url_str: &str) -> Result<(), GuardRejection> {
         message: "Invalid upstream URL".to_owned(),
         retry_after_secs: None,
     })?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ssrf_reject("Only http/https schemes permitted"));
+    if !matches!(parsed.scheme(), "http" | "https") || !parsed.username().is_empty() {
+        return Err(ssrf_reject("Only clean http/https schemes permitted"));
     }
     let Some(host) = parsed.host_str() else {
         return Err(ssrf_reject("Missing upstream host"));
@@ -147,7 +167,7 @@ pub fn validate_upstream_ssrf(url_str: &str) -> Result<(), GuardRejection> {
     Ok(())
 }
 
-fn ssrf_reject(msg: &str) -> GuardRejection {
+pub fn ssrf_reject(msg: &str) -> GuardRejection {
     GuardRejection {
         status: StatusCode::FORBIDDEN,
         message: msg.to_owned(),
@@ -155,17 +175,26 @@ fn ssrf_reject(msg: &str) -> GuardRejection {
     }
 }
 
-fn is_forbidden_ip(ip: IpAddr) -> bool {
+fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || oct[0] == 0
+        || (oct[0] == 100 && (oct[1] & 0xC0) == 64)
+        || (oct[0] == 198 && (oct[1] & 0xFE) == 18)
+        || oct[0] >= 240
+}
+
+pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-        }
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_forbidden_v4(mapped);
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00

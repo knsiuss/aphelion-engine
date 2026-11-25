@@ -6,7 +6,11 @@
   const state = { rows: [], recent: [], sortKey: "req", sortAsc: false };
 
   const $ = id => document.getElementById(id);
-  $("port-pill").textContent = `:${location.port || 18787}`;
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+  const activePort = location.port || (location.protocol === "https:" ? "443" : "80");
+  $("port-pill").textContent = `:${activePort}`;
 
   document.querySelectorAll("#nav-tabs .tab").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -36,15 +40,15 @@
     box.innerHTML = state.recent.slice(0, 50).map(ev => {
       const d = new Date(ev.timestamp_ms || Date.now());
       const hms = d.toISOString().slice(11, 19);
-      const sc = ev.status_code || 200;
+      const sc = Number(ev.status_code || 200);
       const cls = sc >= 500 ? "red" : sc >= 400 ? "amber" : "green";
-      const badges = (ev.badges || []).map(b => `<span class="badge">${b}</span>`).join("");
+      const badges = (ev.badges || []).map(b => `<span class="badge">${esc(b)}</span>`).join("");
       return `<div class="feed-row mono">
-        <span class="muted">${hms}</span>
-        <span>${ev.client || "CLI"}</span>
-        <span>${ev.provider}/${ev.model}${badges}</span>
+        <span class="muted">${esc(hms)}</span>
+        <span>${esc(ev.client || "CLI")}</span>
+        <span>${esc(ev.provider)}/${esc(ev.model)}${badges}</span>
         <span class="${cls}">${sc}</span>
-        <span>${ev.ttft_ms}ms</span>
+        <span>${Number(ev.ttft_ms || 0)}ms</span>
         <span class="green">${Number(ev.cache_hit_pct || 0).toFixed(1)}%</span>
         <span>${fmtTokens(ev.cached_in)}/${fmtTokens(ev.uncached_in)}</span>
         <span>${fmtTokens(ev.output)}(r:${fmtTokens(ev.reasoning)})</span>
@@ -56,15 +60,15 @@
   function renderTable() {
     const q = ($("pm-filter").value || "").toLowerCase();
     const list = state.rows
-      .filter(r => !q || r.provider.toLowerCase().includes(q) || r.model.toLowerCase().includes(q))
+      .filter(r => !q || String(r.provider).toLowerCase().includes(q) || String(r.model).toLowerCase().includes(q))
       .sort((a, b) => {
         const av = a[state.sortKey], bv = b[state.sortKey];
         const cmp = typeof av === "string" ? av.localeCompare(bv) : (av || 0) - (bv || 0);
         return state.sortAsc ? cmp : -cmp;
       });
     $("pm-tbody").innerHTML = list.map(r => `<tr class="mono">
-      <td>${r.provider}</td><td>${r.model}</td><td class="num">${r.req}</td>
-      <td class="num">${r.avg_ttft_ms}ms</td><td class="num green">${Number(r.cache_hit_pct || 0).toFixed(1)}%</td>
+      <td>${esc(r.provider)}</td><td>${esc(r.model)}</td><td class="num">${Number(r.req || 0)}</td>
+      <td class="num">${Number(r.avg_ttft_ms || 0)}ms</td><td class="num green">${Number(r.cache_hit_pct || 0).toFixed(1)}%</td>
       <td class="num">${fmtTokens(r.cached_in)} / ${fmtTokens(r.uncached_in)}</td>
       <td class="num">${fmtTokens(r.output)} (${fmtTokens(r.reasoning)})</td>
       <td class="num green">${fmtUsd(r.net_saved_usd)}</td>
@@ -122,12 +126,12 @@
   const snippets = [
     ["OpenCode", `"provider": { "openai": { "options": { "baseURL": "${base}" } } }`],
     ["Claude Code", `aphelion --audit claude\n# or ANTHROPIC_BASE_URL=${location.origin}`],
-    ["Cursor", `Settings -> Models -> Override OpenAI Base URL:\n${base}`],
+    ["Cursor (via Tunnel)", `cloudflared tunnel --url ${location.origin}\n# Paste https://<tunnel>.trycloudflare.com/v1 in Cursor Models`],
     ["Cline / Roo Code", `API Provider: OpenAI Compatible\nBase URL: ${base}`],
   ];
   $("connect-grid").innerHTML = snippets.map(([name, code], i) => `<div class="card">
-    <div class="card-head"><h2>${name}</h2><button class="copy-btn" data-copy="${i}">Copy</button></div>
-    <pre class="snippet mono">${code}</pre>
+    <div class="card-head"><h2>${esc(name)}</h2><button class="copy-btn" data-copy="${i}">Copy</button></div>
+    <pre class="snippet mono">${esc(code)}</pre>
   </div>`).join("");
   document.querySelectorAll("[data-copy]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -146,7 +150,6 @@
     if (state.recent.length > 50) state.recent.pop();
     renderFeed();
     pulseTopo(ev.client, ev.provider);
-    refresh();
   });
 
   refresh();

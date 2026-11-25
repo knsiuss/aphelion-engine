@@ -1,8 +1,10 @@
 pub mod audit_report;
 pub mod cli_audit;
 pub mod cli_commands;
+pub mod config;
 pub mod headers;
 pub mod metrics;
+pub mod provider_registry;
 pub mod proxy;
 pub mod public_guard;
 pub mod router;

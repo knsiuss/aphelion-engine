@@ -6,10 +6,12 @@ pub mod compaction;
 pub mod composer;
 pub mod compressor;
 pub mod compressor_rules;
+pub mod defaults;
 pub mod diet_gc;
 pub mod economizer;
 pub mod economizer_rules;
 pub mod flight_recorder;
+pub mod ingress_anthropic;
 pub mod ingress_opt;
 pub mod normalizer;
 pub mod optical_history;
@@ -87,7 +89,7 @@ pub fn prepare_request_with_flags(
         .root
         .get("messages")
         .and_then(|m| m.as_array())
-        .map(|a| a.len() > ir.ingress_start)
+        .map(|a| a.len() > ir.mutable_ingress_start())
         .unwrap_or(true);
 
     match ir.workload {

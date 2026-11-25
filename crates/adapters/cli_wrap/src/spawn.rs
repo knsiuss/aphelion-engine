@@ -1,4 +1,4 @@
-#[cfg(windows)]
+use serde_json::{json, Value};
 use std::env;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -58,10 +58,69 @@ fn classify_exec(path: PathBuf) -> ResolvedExec {
     }
 }
 
+/// Cross-OS user home directory resolution (`USERPROFILE` on Windows, `HOME` on POSIX).
+pub fn user_home_dir() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Reads `<home>/.claude/settings.json` and returns `env.ANTHROPIC_BASE_URL` if configured.
+pub fn detect_claude_settings_base_url(home: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()?;
+    let val: Value = serde_json::from_str(&raw).ok()?;
+    val.pointer("/env/ANTHROPIC_BASE_URL")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn is_claude_program(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("claude"))
+}
+
+fn prepare_claude_settings_override(
+    program: &str,
+    args: &[String],
+    proxy_base: &str,
+    home: &Path,
+) -> Option<Vec<String>> {
+    if !is_claude_program(program) || args.iter().any(|a| a == "--settings") {
+        return None;
+    }
+    let existing = detect_claude_settings_base_url(home)?;
+    if existing.trim_end_matches('/') == proxy_base.trim_end_matches('/') {
+        return None;
+    }
+    let tmp_path = env::temp_dir().join(format!(
+        "aphelion_claude_settings_{}.json",
+        std::process::id()
+    ));
+    let payload = json!({ "env": { "ANTHROPIC_BASE_URL": proxy_base } });
+    if std::fs::write(&tmp_path, payload.to_string()).is_ok() {
+        eprintln!(
+            "[aphelion] detected ANTHROPIC_BASE_URL={existing} in ~/.claude/settings.json; injecting --settings override -> {proxy_base}"
+        );
+        let mut updated = args.to_vec();
+        updated.push("--settings".to_owned());
+        updated.push(tmp_path.to_string_lossy().into_owned());
+        return Some(updated);
+    }
+    None
+}
+
 /// Builds a child `tokio::process::Command` with native Windows `.cmd`/`.bat`/`.ps1`
-/// resolution and universal AI harness/SDK base URL environment injection.
+/// resolution, Claude Code `settings.json` override guard, and universal base URL env injection.
 pub fn build_child_command(program: &str, args: &[String], proxy_base: &str) -> Command {
-    let mut cmd = build_platform_command(program, args);
+    let home = user_home_dir();
+    let effective_args = prepare_claude_settings_override(program, args, proxy_base, &home);
+    let final_args = effective_args.as_deref().unwrap_or(args);
+    let mut cmd = build_platform_command(program, final_args);
     inject_universal_env(&mut cmd, proxy_base);
     cmd
 }
