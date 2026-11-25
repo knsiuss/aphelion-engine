@@ -1,6 +1,6 @@
-# Aphelion (`aphelion`) v1.0
+# Aphelion (`aphelion-engine`) v3.0
 
-**Universal Sans-I/O Layer-3 AI Inference & Token Optimizer for Every Coding Agent, Router, SDK, and Non-Agentic Workload.**
+**Universal Zero-Config AI Token Optimization Gateway for Every Coding Agent, Router, SDK, and Non-Agentic Workload.**
 
 `aphelion` transparently optimizes OpenAI Chat, OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), Google Gemini (`*:generateContent`), and Ollama (`/api/chat`, `/api/generate`) traffic using **Strict KV-Cache Preservation (Append-Only Prefix Invariance)**:
 
@@ -23,11 +23,13 @@ aphelion --audit --upstream http://localhost:20128/v1 claude   # chain to 9Route
 aphelion --audit-summary                                       # verified cache hits & $ saved
 ```
 
-### 2. Universal Gateway Mode (`aphelion serve`)
-Start a single local gateway for GUI IDEs, routers, SDKs, Chat UIs, and `curl`:
+### 2. Universal Gateway Mode (`npx aphelion-engine serve` / `aphelion serve`)
+Start a single zero-config auto-detect gateway for GUI IDEs, routers, SDKs, Chat UIs, and `curl`:
 
 ```bash
-aphelion serve --port 18787 --upstream https://api.openai.com/v1 --audit
+npx aphelion-engine serve --port 18787
+# or public BYOK gateway mode (401 auth, rate-limit, SSRF guard, /health, /metrics):
+npx aphelion-engine serve --public --bind 127.0.0.1:18787 --rpm 120 --max-body-mb 10
 ```
 
 * **OpenCode (`opencode.json`) / Cursor / Cline / Roo Code:** Point your OpenAI/Anthropic provider `baseURL` to `http://127.0.0.1:18787/v1` (or `http://127.0.0.1:18787/anthropic`).
@@ -45,10 +47,10 @@ aphelion serve --port 18787 --upstream https://api.openai.com/v1 --audit
     -H "Content-Type: application/json" -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
   ```
 
-### 3. In-Process Router Middleware (`@aphelion/middleware`)
+### 3. In-Process Router Middleware (`aphelion-engine-middleware`)
 
 ```js
-import { createAphelionMiddleware } from "@aphelion/middleware";
+import { createAphelionMiddleware } from "aphelion-engine-middleware";
 const aphelion = createAphelionMiddleware({ profile: "LongLived" });
 ```
 

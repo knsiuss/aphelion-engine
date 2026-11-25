@@ -1,8 +1,14 @@
 {
-  "name": "@aphelion/middleware",
-  "version": "3.0.0",
+  "name": "aphelion-engine-middleware",
+  "version": "3.0.1",
   "description": "In-process LongLived router middleware for Aphelion (9Router, LiteLLM, Node fetch pipelines)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knsiuss/aphelion-engine.git"
+  },
+  "homepage": "https://github.com/knsiuss/aphelion-engine#readme",
+  "keywords": ["ai", "llm", "middleware", "kv-cache", "token-optimizer"],
   "type": "module",
   "main": "./src/index.mjs",
   "types": "./src/index.d.ts",

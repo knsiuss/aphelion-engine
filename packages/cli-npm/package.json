@@ -1,10 +1,17 @@
 {
-  "name": "aphelion",
-  "version": "3.0.0",
-  "description": "Zero-daemon Sans-I/O token and inference optimizer launcher for coding agents",
+  "name": "aphelion-engine",
+  "version": "3.0.1",
+  "description": "Zero-config KV-cache-preserving AI token optimization gateway for coding agents, SDKs, and routers",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knsiuss/aphelion-engine.git"
+  },
+  "homepage": "https://github.com/knsiuss/aphelion-engine#readme",
+  "keywords": ["ai", "llm", "proxy", "gateway", "kv-cache", "token-optimizer", "openai", "anthropic", "gemini"],
   "bin": {
-    "aphelion": "./bin/aphelion.js"
+    "aphelion": "./bin/aphelion.js",
+    "aphelion-engine": "./bin/aphelion.js"
   },
   "files": [
     "bin/"
