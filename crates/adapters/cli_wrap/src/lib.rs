@@ -6,6 +6,7 @@ pub mod cli_commands;
 pub mod combo_pool;
 pub mod config;
 pub mod failover;
+pub mod harness_io;
 pub mod headers;
 pub mod ide_activator;
 pub mod metrics;

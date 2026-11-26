@@ -1,6 +1,8 @@
+use crate::harness_io::{
+    activate_config, backup_path, deactivate_config, read_configured_url, ConfigFormat,
+};
 use crate::spawn::user_home_dir;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,113 +16,202 @@ pub struct IntegrationStatus {
     pub can_restore: bool,
 }
 
-fn claude_settings_path(home: &Path) -> PathBuf {
-    home.join(".claude").join("settings.json")
+#[derive(Clone, Copy)]
+struct HarnessSpec {
+    id: &'static str,
+    name: &'static str,
+    fmt: ConfigFormat,
+    use_v1: bool,
 }
 
-fn backup_path(target: &Path) -> PathBuf {
-    let mut p = target.as_os_str().to_os_string();
-    p.push(".aphelion.bak");
-    PathBuf::from(p)
+const HARNESSES: &[HarnessSpec] = &[
+    HarnessSpec {
+        id: "claude_code",
+        name: "Claude Code (CLI + VS Code / GUI)",
+        fmt: ConfigFormat::JsonPath(&["env", "ANTHROPIC_BASE_URL"]),
+        use_v1: false,
+    },
+    HarnessSpec {
+        id: "mistral_vibe",
+        name: "Mistral Vibe / CLI",
+        fmt: ConfigFormat::TomlKey("api_base"),
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "codex_cli",
+        name: "OpenAI Codex CLI",
+        fmt: ConfigFormat::TomlKey("base_url"),
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "opencode",
+        name: "OpenCode",
+        fmt: ConfigFormat::JsonPath(&["provider", "openai", "options", "baseURL"]),
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "gemini_cli",
+        name: "Gemini CLI",
+        fmt: ConfigFormat::JsonPath(&["env", "GOOGLE_GEMINI_BASE_URL"]),
+        use_v1: false,
+    },
+    HarnessSpec {
+        id: "aider",
+        name: "Aider",
+        fmt: ConfigFormat::YamlKey("openai-api-base"),
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "cursor",
+        name: "Cursor IDE",
+        fmt: ConfigFormat::ReadOnlyDir,
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "windsurf",
+        name: "Windsurf IDE",
+        fmt: ConfigFormat::ReadOnlyDir,
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "cline_roo",
+        name: "Cline / Roo Code (VS Code)",
+        fmt: ConfigFormat::ReadOnlyDir,
+        use_v1: true,
+    },
+    HarnessSpec {
+        id: "continue_dev",
+        name: "Continue",
+        fmt: ConfigFormat::ReadOnlyDir,
+        use_v1: true,
+    },
+];
+
+fn resolve_paths(home: &Path, id: &str) -> (PathBuf, bool) {
+    match id {
+        "claude_code" => (
+            home.join(".claude").join("settings.json"),
+            home.join(".claude").exists() || home.join(".claude").join("settings.json").exists(),
+        ),
+        "mistral_vibe" => {
+            let vibe = home.join(".vibe").join("config.toml");
+            let mistral = home.join(".mistral").join("config.toml");
+            let p = if !home.join(".vibe").exists() && home.join(".mistral").exists() {
+                mistral
+            } else {
+                vibe
+            };
+            let det = home.join(".vibe").exists() || home.join(".mistral").exists();
+            (p, det)
+        }
+        "codex_cli" => (
+            home.join(".codex").join("config.toml"),
+            home.join(".codex").exists(),
+        ),
+        "opencode" => {
+            let xdg = home.join(".config").join("opencode").join("opencode.json");
+            let appdata = std::env::var_os("APPDATA")
+                .map(|a| PathBuf::from(a).join("opencode").join("opencode.json"));
+            let det = home.join(".config").join("opencode").exists()
+                || appdata.as_ref().is_some_and(|p| p.parent().is_some_and(|d| d.exists()));
+            let path = if !home.join(".config").join("opencode").exists() {
+                appdata.unwrap_or(xdg)
+            } else {
+                xdg
+            };
+            (path, det)
+        }
+        "gemini_cli" => (
+            home.join(".gemini").join("settings.json"),
+            home.join(".gemini").exists(),
+        ),
+        "aider" => {
+            let p = home.join(".aider.conf.yml");
+            (p.clone(), p.exists())
+        }
+        "cursor" => {
+            let p = home.join(".cursor");
+            (p.clone(), p.exists())
+        }
+        "windsurf" => {
+            let p = home.join(".codeium").join("windsurf");
+            (p.clone(), p.exists())
+        }
+        "cline_roo" => {
+            let p = home.join(".vscode").join("extensions");
+            (p.clone(), p.exists())
+        }
+        "continue_dev" => {
+            let p = home.join(".continue").join("config.yaml");
+            (p.clone(), home.join(".continue").exists() || p.exists())
+        }
+        _ => (home.to_path_buf(), false),
+    }
 }
 
-fn is_local_aphelion(url: &str, proxy_base: &str) -> bool {
+fn effective_url(proxy_base: &str, use_v1: bool) -> String {
+    let base = proxy_base.trim().trim_end_matches('/');
+    if use_v1 { format!("{base}/v1") } else { base.to_owned() }
+}
+
+fn is_local_aphelion(url: &str, expected: &str) -> bool {
     let norm = url.trim().trim_end_matches('/');
-    let p_norm = proxy_base.trim().trim_end_matches('/');
-    let alt = p_norm.replace("127.0.0.1", "localhost");
-    norm.eq_ignore_ascii_case(p_norm) || norm.eq_ignore_ascii_case(&alt)
+    let e_norm = expected.trim().trim_end_matches('/');
+    let alt = e_norm.replace("127.0.0.1", "localhost");
+    norm.eq_ignore_ascii_case(e_norm) || norm.eq_ignore_ascii_case(&alt)
 }
 
-/// Inspects Claude Code (`~/.claude/settings.json`) integration status without mutating anything.
+fn build_status(home: &Path, spec: &HarnessSpec, proxy_base: &str) -> IntegrationStatus {
+    let (path, detected) = resolve_paths(home, spec.id);
+    let expected = effective_url(proxy_base, spec.use_v1);
+    let current_url = read_configured_url(&path, spec.fmt);
+    let active = current_url.as_deref().is_some_and(|u| is_local_aphelion(u, &expected));
+    let can_restore = !matches!(spec.fmt, ConfigFormat::ReadOnlyDir) && backup_path(&path).exists();
+    IntegrationStatus {
+        id: spec.id.to_owned(),
+        name: spec.name.to_owned(),
+        detected: detected || current_url.is_some(),
+        active,
+        config_path: path.display().to_string(),
+        current_url,
+        can_restore,
+    }
+}
+
 pub fn inspect_integrations(proxy_base: &str) -> Vec<IntegrationStatus> {
     inspect_integrations_in(&user_home_dir(), proxy_base)
 }
 
 pub fn inspect_integrations_in(home: &Path, proxy_base: &str) -> Vec<IntegrationStatus> {
-    let claude_path = claude_settings_path(home);
-    let claude_detected = home.join(".claude").exists() || claude_path.exists();
-    let current_url = std::fs::read_to_string(&claude_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.pointer("/env/ANTHROPIC_BASE_URL").and_then(Value::as_str).map(str::to_owned));
-    let active = current_url.as_deref().is_some_and(|u| is_local_aphelion(u, proxy_base));
-    let can_restore = backup_path(&claude_path).exists();
-
-    vec![IntegrationStatus {
-        id: "claude_code".to_owned(),
-        name: "Claude Code (CLI + VS Code / GUI)".to_owned(),
-        detected: claude_detected,
-        active,
-        config_path: claude_path.display().to_string(),
-        current_url,
-        can_restore,
-    }]
+    let mut list: Vec<IntegrationStatus> = HARNESSES
+        .iter()
+        .map(|s| build_status(home, s, proxy_base))
+        .collect();
+    list.sort_by_key(|item| !item.detected);
+    list
 }
 
-/// Activates Aphelion for a supported IDE (backs up existing config first; preserves all plugins/MCP).
 pub fn activate_integration(id: &str, proxy_base: &str) -> Result<IntegrationStatus, String> {
     activate_integration_in(&user_home_dir(), id, proxy_base)
 }
 
 pub fn activate_integration_in(home: &Path, id: &str, proxy_base: &str) -> Result<IntegrationStatus, String> {
-    if id != "claude_code" {
-        return Err(format!("unsupported integration `{id}`"));
-    }
-    let path = claude_settings_path(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
-    }
-    let bak = backup_path(&path);
-    let mut root = if path.exists() {
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
-        if !bak.exists() {
-            std::fs::write(&bak, &raw).map_err(|e| format!("backup failed: {e}"))?;
-        }
-        serde_json::from_str::<Value>(&raw).map_err(|e| format!("invalid json: {e}"))?
-    } else {
-        json!({})
-    };
-    let obj = root.as_object_mut().ok_or_else(|| "settings.json root must be an object".to_owned())?;
-    let env_val = obj.entry("env").or_insert_with(|| json!({}));
-    let env_obj = env_val.as_object_mut().ok_or_else(|| "settings.json `env` must be an object".to_owned())?;
-    env_obj.insert("ANTHROPIC_BASE_URL".to_owned(), Value::String(proxy_base.trim_end_matches('/').to_owned()));
-
-    let pretty = serde_json::to_string_pretty(&root).map_err(|e| format!("serialize failed: {e}"))?;
-    std::fs::write(&path, pretty).map_err(|e| format!("write failed: {e}"))?;
-    inspect_integrations_in(home, proxy_base)
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| "status lookup failed".to_owned())
+    let spec = HARNESSES.iter().find(|s| s.id == id)
+        .ok_or_else(|| format!("unsupported integration `{id}`"))?;
+    let (path, _) = resolve_paths(home, id);
+    let url = effective_url(proxy_base, spec.use_v1);
+    activate_config(&path, spec.fmt, &url)?;
+    Ok(build_status(home, spec, proxy_base))
 }
 
-/// Deactivates Aphelion by restoring the `.aphelion.bak` backup (or removing `ANTHROPIC_BASE_URL`).
 pub fn deactivate_integration(id: &str, proxy_base: &str) -> Result<IntegrationStatus, String> {
     deactivate_integration_in(&user_home_dir(), id, proxy_base)
 }
 
 pub fn deactivate_integration_in(home: &Path, id: &str, proxy_base: &str) -> Result<IntegrationStatus, String> {
-    if id != "claude_code" {
-        return Err(format!("unsupported integration `{id}`"));
-    }
-    let path = claude_settings_path(home);
-    let bak = backup_path(&path);
-    if bak.exists() {
-        let orig = std::fs::read_to_string(&bak).map_err(|e| format!("read backup failed: {e}"))?;
-        std::fs::write(&path, orig).map_err(|e| format!("restore failed: {e}"))?;
-        let _ = std::fs::remove_file(&bak);
-    } else if path.exists() {
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
-        if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
-            if let Some(env_obj) = root.get_mut("env").and_then(Value::as_object_mut) {
-                env_obj.remove("ANTHROPIC_BASE_URL");
-            }
-            if let Ok(pretty) = serde_json::to_string_pretty(&root) {
-                let _ = std::fs::write(&path, pretty);
-            }
-        }
-    }
-    inspect_integrations_in(home, proxy_base)
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| "status lookup failed".to_owned())
+    let spec = HARNESSES.iter().find(|s| s.id == id)
+        .ok_or_else(|| format!("unsupported integration `{id}`"))?;
+    let (path, _) = resolve_paths(home, id);
+    deactivate_config(&path, spec.fmt)?;
+    Ok(build_status(home, spec, proxy_base))
 }

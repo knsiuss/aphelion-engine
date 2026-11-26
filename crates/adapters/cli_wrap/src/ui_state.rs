@@ -213,25 +213,28 @@ impl TopologyTracker {
     }
 }
 
-/// Detects a non-sensitive client tag from `X-Title`, `HTTP-Referer`, or `User-Agent`.
+/// Dynamically detects a non-sensitive client tag from `X-Title`, `X-Client-Name`, or `User-Agent`.
 pub fn detect_client_tag(headers: &HeaderMap) -> String {
-    let probe = ["x-title", "http-referer", "user-agent"]
-        .into_iter()
-        .filter_map(|k| headers.get(k).and_then(|v| v.to_str().ok()))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    if probe.contains("opencode") {
-        "OpenCode".to_owned()
-    } else if probe.contains("claude") {
-        "Claude Code".to_owned()
-    } else if probe.contains("cursor") {
-        "Cursor".to_owned()
-    } else if probe.contains("cline") || probe.contains("roo") {
-        "Cline".to_owned()
-    } else if probe.contains("aider") {
-        "Aider".to_owned()
-    } else if probe.contains("python") || probe.contains("openai") {
+    for key in ["x-title", "x-client-name"] {
+        if let Some(raw) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            let clean: String = raw.trim().chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(32).collect();
+            if !clean.is_empty() {
+                return clean;
+            }
+        }
+    }
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().trim();
+    let product = ua.split_whitespace().next().unwrap_or_default().split('/').next().unwrap_or_default().trim();
+    let lower = product.to_ascii_lowercase();
+    const GENERIC: &[&str] = &[
+        "curl", "wget", "reqwest", "hyper", "python-httpx", "python-requests",
+        "aiohttp", "node", "node-fetch", "undici", "axios", "go-http-client", "mozilla", "okhttp",
+    ];
+    if !product.is_empty() && !GENERIC.contains(&lower.as_str()) {
+        return product.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(32).collect();
+    }
+    let ua_lower = ua.to_ascii_lowercase();
+    if ua_lower.contains("python") || ua_lower.contains("openai") {
         "SDK".to_owned()
     } else {
         "CLI".to_owned()

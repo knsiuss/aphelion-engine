@@ -171,10 +171,17 @@ fn inject_universal_env(cmd: &mut Command, proxy_base: &str) {
         .env("OPENAI_API_BASE", &v1)
         .env("OPENROUTER_BASE_URL", &v1)
         .env("DEEPSEEK_BASE_URL", &v1)
+        .env("MISTRAL_API_BASE", &v1)
+        .env("MISTRAL_BASE_URL", &v1)
+        .env("MISTRAL_SERVER_URL", proxy_base)
+        .env("VIBE_API_BASE", &v1)
+        .env("GROQ_BASE_URL", &v1)
+        .env("XAI_BASE_URL", &v1)
         .env("ANTHROPIC_BASE_URL", proxy_base)
         .env("GEMINI_API_BASE_URL", proxy_base)
         .env("GOOGLE_GEMINI_BASE_URL", proxy_base)
-        .env("OLLAMA_HOST", proxy_base);
+        .env("OLLAMA_HOST", proxy_base)
+        .env("OLLAMA_BASE_URL", proxy_base);
 }
 
 #[cfg(test)]

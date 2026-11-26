@@ -1,60 +1,28 @@
 use crate::config::{GatewayConfig, DEFAULT_GATEWAY_PORT, DEFAULT_LOCAL_HOST};
+use crate::ide_activator::inspect_integrations;
 use crate::spawn::{detect_claude_settings_base_url, user_home_dir};
-use std::env;
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-fn user_config_dir(home: &Path) -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .or_else(|| env::var_os("APPDATA"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
-}
-
-/// `aphelion doctor`: detects local IDEs using cross-OS paths and prints dynamic `baseURL` hints
-/// without reading or modifying any user secrets.
+/// `aphelion doctor`: detects local agent harnesses & IDEs using unified registry
+/// without modifying user secrets.
 pub fn run_doctor() {
     let home = user_home_dir();
-    let cfg_dir = user_config_dir(&home);
     let port = GatewayConfig::env_port(DEFAULT_GATEWAY_PORT);
-    let base = format!("http://{DEFAULT_LOCAL_HOST}:{port}/v1");
     let anthropic_base = format!("http://{DEFAULT_LOCAL_HOST}:{port}");
 
-    println!("Aphelion v3.3 Doctor — Zero-Config IDE Onboarding");
+    println!("Aphelion v3.8 Doctor — Universal Agent Harness Onboarding");
     println!("Start gateway: aphelion serve --port {port} --audit");
     println!("Open dashboard: aphelion ui --port {port}\n");
 
-    let opencode_paths = [cfg_dir.join("opencode"), home.join(".config").join("opencode")];
-    let checks: [(&str, bool, String); 5] = [
-        (
-            "ClaudeCode",
-            home.join(".claude").exists(),
-            format!(r#"Set ANTHROPIC_BASE_URL: "{anthropic_base}" or run `aphelion claude`"#),
-        ),
-        (
-            "OpenCode",
-            opencode_paths.iter().any(|p| p.exists()),
-            format!(r#"Set provider baseURL: "{base}""#),
-        ),
-        (
-            "Cursor",
-            home.join(".cursor").exists(),
-            format!("Settings -> Models -> Override OpenAI Base URL: {base}"),
-        ),
-        (
-            "Cline",
-            home.join(".vscode").join("extensions").exists(),
-            format!("Cline Settings -> OpenAI Compatible Base URL: {base}"),
-        ),
-        (
-            "Continue",
-            home.join(".continue").exists(),
-            format!("config.yaml -> apiBase: {base}"),
-        ),
-    ];
-    for (name, found, hint) in checks {
-        let status = if found { "DETECTED" } else { "not found" };
-        println!("  [{status:^9}] {name:<10} -> {hint}");
+    for item in inspect_integrations(&anthropic_base) {
+        let status = if item.active {
+            "ACTIVE"
+        } else if item.detected {
+            "DETECTED"
+        } else {
+            "not found"
+        };
+        println!("  [{status:^9}] {:<32} -> {}", item.name, item.config_path);
     }
 
     if let Some(claude_url) = detect_claude_settings_base_url(&home) {
