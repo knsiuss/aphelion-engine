@@ -4,7 +4,7 @@ use crate::defaults::{
 };
 use crate::diet_gc::estimate_calibrated_tokens;
 use crate::prefix_ledger::{commit_outbound_messages, FrozenSessionRecord};
-use crate::types::{CompactMode, NormalizedRequest, SessionState};
+use crate::types::{CompactMode, Dialect, NormalizedRequest, SessionState};
 use serde_json::{json, Value};
 
 /// Amortized Break-Even Gate for Macro-Compaction:
@@ -113,21 +113,37 @@ pub fn run_amortized_compaction(ir: &mut NormalizedRequest, state: &mut SessionS
     if tail_start <= 1 {
         return;
     }
+    let orig_len = messages.len();
     let record_snapshot = state.prefix_ledger.get(&key).cloned().unwrap_or_default();
     let checkpoint_text = build_checkpoint_summary(&messages[1..tail_start], &record_snapshot);
 
-    let mut compacted = Vec::with_capacity(messages.len() - tail_start + 2);
+    let mut compacted = Vec::with_capacity(messages.len() - tail_start + 3);
     compacted.push(messages[0].clone());
-    compacted.push(json!({
-        "role": "user",
-        "content": checkpoint_text
-    }));
+    if ir.dialect == Dialect::AnthropicMessages {
+        compacted.push(json!({
+            "role": "assistant",
+            "content": checkpoint_text
+        }));
+        if messages[tail_start].get("role").and_then(Value::as_str) == Some("assistant") {
+            compacted.push(json!({
+                "role": "user",
+                "content": "[Continue from checkpoint]"
+            }));
+        }
+    } else {
+        compacted.push(json!({
+            "role": "user",
+            "content": checkpoint_text
+        }));
+    }
     compacted.extend_from_slice(&messages[tail_start..]);
+    let dropped_here = orig_len.saturating_sub(compacted.len());
     *messages = compacted;
 
     // Atomic PrefixLedger Epoch Rollover: immediately restores S_prefix == 1.00 on next turn.
     let rec = state.prefix_ledger.get_or_insert_mut(key);
     rec.compaction_epoch += 1;
+    rec.compacted_dropped_count += dropped_here;
     commit_outbound_messages(messages, rec);
     ir.ingress_start = messages.len();
     ir.last_cached_msg_idx = messages.iter().rposition(crate::normalizer::has_cache_control);

@@ -85,6 +85,8 @@ pub fn compose_outbound(
                 ir.root["messages"] = original_msgs;
                 ir.stage_stats.validator_rollback = true;
                 ir.stage_stats.ingress_saved_tokens = 0;
+                ir.stage_stats.macro_compaction_triggered = false;
+                ir.stage_stats.compaction_tokens_reclaimed = 0;
                 ir.assistant_prefill = None;
             }
         }

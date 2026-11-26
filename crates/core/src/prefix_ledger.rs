@@ -29,6 +29,8 @@ pub struct FrozenSessionRecord {
     pub frozen_file_hashes: HashMap<String, u64>,
     pub committed_len: usize,
     pub compaction_epoch: u32,
+    #[serde(default)]
+    pub compacted_dropped_count: usize,
     pub rolling_cached_read: usize,
     pub rolling_total_input: usize,
     pub usage_turns: usize,
@@ -124,43 +126,52 @@ impl PrefixLedger {
 /// Replays strictly frozen historical messages `0..k` verbatim into `messages`,
 /// verifying role and user-prompt prefix continuity so client history edits/rewinds
 /// fork cleanly at the divergence index instead of overwriting user edits.
-pub fn replay_frozen_history(messages: &mut [Value], record: &FrozenSessionRecord) -> usize {
+fn has_checkpoint_msg(msgs: &[Value], record: &FrozenSessionRecord) -> bool {
+    record.compaction_epoch > 0
+        || msgs
+            .get(1)
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("[APHELION_CHECKPOINT"))
+}
+
+pub fn replay_frozen_history(messages: &mut Vec<Value>, record: &FrozenSessionRecord) -> usize {
     let k = record.committed_len.min(record.frozen_messages.len());
     if k == 0 || messages.is_empty() {
         return 0;
     }
-    let has_checkpoint = record.compaction_epoch > 0
-        || record
-            .frozen_messages
-            .get(1)
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.starts_with("[APHELION_CHECKPOINT"));
-    if has_checkpoint && messages.len() >= k {
-        for (slot, frozen) in messages[..k].iter_mut().zip(record.frozen_messages[..k].iter()) {
-            let mut merged = frozen.clone();
-            sync_incoming_cache_control(slot, &mut merged);
-            *slot = merged;
+    if has_checkpoint_msg(&record.frozen_messages, record) {
+        let raw_len = k.saturating_add(record.compacted_dropped_count);
+        let client_uncompacted = record.compacted_dropped_count > 0
+            && messages.len() >= raw_len
+            && !messages.get(1).and_then(|m| m.get("content")).and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("[APHELION_CHECKPOINT"));
+        if client_uncompacted {
+            let replayed: Vec<Value> = record.frozen_messages[..k].iter().enumerate().map(|(i, frozen)| {
+                let mut merged = frozen.clone();
+                if i == 0 { if let Some(inc0) = messages.first() { sync_incoming_cache_control(inc0, &mut merged); } }
+                merged
+            }).collect();
+            messages.splice(0..raw_len, replayed);
+            return k;
         }
-        return k;
+        if messages.len() >= k {
+            for (slot, frozen) in messages[..k].iter_mut().zip(record.frozen_messages[..k].iter()) {
+                let mut merged = frozen.clone();
+                sync_incoming_cache_control(slot, &mut merged);
+                *slot = merged;
+            }
+            return k;
+        }
     }
 
     let limit = k.min(messages.len());
     let mut matched = 0usize;
-    for (i, (inc, frz)) in messages[..limit]
-        .iter()
-        .zip(record.frozen_messages[..limit].iter())
-        .enumerate()
-    {
-        if !message_slot_compatible(inc, frz) {
-            break;
-        }
+    for (i, (inc, frz)) in messages[..limit].iter().zip(record.frozen_messages[..limit].iter()).enumerate() {
+        if !message_slot_compatible(inc, frz) { break; }
         matched = i + 1;
     }
-    for (slot, frozen) in messages[..matched]
-        .iter_mut()
-        .zip(record.frozen_messages[..matched].iter())
-    {
+    for (slot, frozen) in messages[..matched].iter_mut().zip(record.frozen_messages[..matched].iter()) {
         let mut merged = frozen.clone();
         sync_incoming_cache_control(slot, &mut merged);
         *slot = merged;
@@ -174,12 +185,8 @@ fn sync_incoming_cache_control(incoming: &Value, target: &mut Value) {
     match (incoming, target) {
         (Value::Object(in_map), Value::Object(tgt_map)) => {
             match in_map.get("cache_control") {
-                Some(cc) if !cc.is_null() => {
-                    tgt_map.insert("cache_control".to_owned(), cc.clone());
-                }
-                _ => {
-                    tgt_map.remove("cache_control");
-                }
+                Some(cc) if !cc.is_null() => { tgt_map.insert("cache_control".to_owned(), cc.clone()); }
+                _ => { tgt_map.remove("cache_control"); }
             }
             if let (Some(in_c), Some(tgt_c)) = (in_map.get("content"), tgt_map.get_mut("content")) {
                 sync_incoming_cache_control(in_c, tgt_c);

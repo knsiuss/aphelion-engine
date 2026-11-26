@@ -1,7 +1,8 @@
 use aphelion_cli::combo_pool::{ComboConfig, ComboPool, ComboStrategy, ComboTarget};
 use aphelion_core::prepare_request;
-use aphelion_core::types::{ExecutionProfile, SessionState};
-use serde_json::json;
+use aphelion_core::types::{CompactMode, Dialect, ExecutionProfile, SessionState};
+use aphelion_core::validator::validate_outbound_messages;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[test]
@@ -142,4 +143,51 @@ fn consecutive_user_messages_do_not_rollback_rtk_savings() {
         out.body.len(),
         raw.len()
     );
+}
+
+#[test]
+fn anthropic_compaction_does_not_rollback_and_stateless_next_turn_stays_compacted() {
+    let mut state = SessionState::default();
+    let mut msgs = vec![json!({"role": "user", "content": "Initial task root"})];
+    for i in 1..=7 {
+        msgs.push(json!({"role": "assistant", "content": format!("Step {i} analysis")}));
+        msgs.push(json!({"role": "user", "content": format!("Ack {i} proceed")}));
+    }
+    assert_eq!(msgs.len(), 15);
+
+    let make_payload = |m: &[Value]| {
+        serde_json::to_vec(&json!({
+            "anthropic_version": "2023-06-01",
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "system": [{ "type": "text", "text": "Coding assistant", "cache_control": { "type": "ephemeral" } }],
+            "tools": [{ "name": "Read", "input_schema": { "type": "object" } }],
+            "messages": m
+        })).unwrap()
+    };
+
+    let _ = prepare_request(&make_payload(&msgs), ExecutionProfile::Ephemeral, &mut state).expect("turn0");
+
+    state.request_options.compact_mode = CompactMode::Force;
+    let out1 = prepare_request(&make_payload(&msgs), ExecutionProfile::Ephemeral, &mut state).expect("turn1");
+    assert!(out1.metrics.stage_stats.macro_compaction_triggered);
+    assert!(!out1.metrics.stage_stats.validator_rollback);
+    let p1: Value = serde_json::from_slice(&out1.body).unwrap();
+    assert!(validate_outbound_messages(Dialect::AnthropicMessages, &p1).is_ok());
+    let p1_msgs = p1["messages"].as_array().unwrap();
+    assert!(p1_msgs.len() < 15, "expected compacted len < 15, got {}", p1_msgs.len());
+
+    // Turn 2: stateless client sends FULL uncompacted 15 messages + 2 new messages (17 total).
+    state.request_options.compact_mode = CompactMode::Auto;
+    let mut msgs2 = msgs.clone();
+    msgs2.push(json!({"role": "assistant", "content": "New assistant reply"}));
+    msgs2.push(json!({"role": "user", "content": "New follow up"}));
+    assert_eq!(msgs2.len(), 17);
+
+    let out2 = prepare_request(&make_payload(&msgs2), ExecutionProfile::Ephemeral, &mut state).expect("turn2");
+    assert!(!out2.metrics.stage_stats.macro_compaction_triggered, "must not re-compact on next turn");
+    let p2: Value = serde_json::from_slice(&out2.body).unwrap();
+    let p2_msgs = p2["messages"].as_array().unwrap();
+    assert_eq!(p2_msgs.len(), p1_msgs.len() + 2);
+    assert_eq!(&p2_msgs[..p1_msgs.len()], p1_msgs.as_slice());
 }
