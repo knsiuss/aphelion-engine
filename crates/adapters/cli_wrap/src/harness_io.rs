@@ -191,18 +191,36 @@ fn upsert_kv_line(raw: Option<&str>, key: &str, sep: char, new_line: &str, prepe
 }
 
 fn remove_kv_line(raw: &str, key: &str, sep: char) -> String {
-    let lines: Vec<&str> = raw
-        .lines()
-        .filter(|line| {
-            let t = line.trim();
-            t.is_empty()
-                || t.starts_with('#')
-                || !t.split_once(sep).is_some_and(|(lhs, _)| lhs.trim() == key)
-        })
-        .collect();
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    }
+    let lines: Vec<&str> = raw.lines().filter(|line| {
+        let t = line.trim();
+        t.is_empty() || t.starts_with('#') || !t.split_once(sep).is_some_and(|(lhs, _)| lhs.trim() == key)
+    }).collect();
+    if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) }
+}
+
+pub fn strip_harness_prefix(path_and_query: &str) -> Option<(String, String)> {
+    let after = path_and_query.strip_prefix("/h/")?;
+    let (id, rest) = match after.find(['/', '?']) {
+        Some(idx) => (&after[..idx], &after[idx..]),
+        None => (after, "/"),
+    };
+    if id.is_empty() || id.contains('@') { return None; }
+    let norm_rest = if rest.starts_with('/') { rest.to_owned() } else { format!("/{rest}") };
+    Some((id.to_owned(), norm_rest))
+}
+
+pub fn default_harness_routes_path(home: &Path) -> PathBuf {
+    home.join(".aphelion").join("harness_routes.json")
+}
+
+pub fn load_harness_routes_from(path: &Path) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_harness_route_to(path: &Path, id: &str, url: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?; }
+    let mut map = load_harness_routes_from(path);
+    map.insert(id.to_owned(), url.trim().trim_end_matches('/').to_owned());
+    let text = serde_json::to_string_pretty(&map).map_err(|e| format!("serialize failed: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("write failed: {e}"))
 }

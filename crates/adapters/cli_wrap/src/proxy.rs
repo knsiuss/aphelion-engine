@@ -147,30 +147,33 @@ async fn handle_request(
         return Ok(static_resp(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "request body exceeds max limit".to_owned()));
     };
 
+    let (harness_id, eff_path) = crate::harness_io::strip_harness_prefix(&path_and_query)
+        .map(|(h, p)| (Some(h), p)).unwrap_or_else(|| (None, path_and_query.clone()));
     let body_json = serde_json::from_slice::<serde_json::Value>(&decoded_body).ok();
-    let route = match AutoRouter::resolve(&headers, &path_and_query, body_json.as_ref(), &state.targets, state.public_cfg.public_mode) {
-        Ok(r) => r,
-        Err(rej) => return Ok(reject_response(rej, &state)),
+    let learned = harness_id.as_deref().and_then(|hid| {
+        let rp = crate::harness_io::default_harness_routes_path(&crate::spawn::user_home_dir());
+        crate::harness_io::load_harness_routes_from(&rp).remove(hid)
+    });
+    let route = if let (Some(hid), Some(base)) = (&harness_id, learned) {
+        if state.public_cfg.public_mode {
+            if let Err(rej) = crate::public_guard::validate_upstream_ssrf(&base) { return Ok(reject_response(rej, &state)); }
+        }
+        crate::router::ResolvedRoute { provider_id: hid.clone(), target_url: crate::headers::join_base_path(&base, &eff_path) }
+    } else {
+        match AutoRouter::resolve(&headers, &eff_path, body_json.as_ref(), &state.targets, state.public_cfg.public_mode) {
+            Ok(r) => r, Err(rej) => return Ok(reject_response(rej, &state)),
+        }
     };
 
-    let should_bypass = method != hyper::Method::POST
-        || decoded_body.is_empty()
-        || has_bypass_header(&headers)
-        || is_passthrough_path(&path_and_query);
-
+    let should_bypass = method != hyper::Method::POST || decoded_body.is_empty()
+        || has_bypass_header(&headers) || is_passthrough_path(&eff_path);
     let mut req_opts = parse_request_options(&headers, tenant_hash, &route.provider_id);
-    let (fallbacks, adaptive_fallback) = if let Ok(pol) = state.policy.read() {
-        pol.apply_to_request(&mut req_opts, &headers);
-        (pol.fallback_models.clone(), pol.adaptive_fallback)
-    } else {
-        (Vec::new(), true)
-    };
-    let client_tag = detect_client_tag(&headers);
-    let (outbound_body, mut pending) = if should_bypass {
-        (decoded_body, None)
-    } else {
-        prepare_outbound(&state, &decoded_body, req_opts, &route.provider_id, &client_tag)
-    };
+    let (fallbacks, adaptive_fallback) = state.policy.read()
+        .map(|pol| { pol.apply_to_request(&mut req_opts, &headers); (pol.fallback_models.clone(), pol.adaptive_fallback) })
+        .unwrap_or((Vec::new(), true));
+    let client_tag = harness_id.unwrap_or_else(|| detect_client_tag(&headers));
+    let (outbound_body, mut pending) = if should_bypass { (decoded_body, None) }
+        else { prepare_outbound(&state, &decoded_body, req_opts, &route.provider_id, &client_tag) };
 
     let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let slots = if should_bypass {
@@ -183,9 +186,9 @@ async fn handle_request(
         )
     };
     let Some(disp) = dispatch_with_failover(
-        &state.client, req_method, &route.target_url, &path_and_query, &headers, outbound_body, &slots, &state.failover, &state.quotas,
+        &state.client, req_method, &route.target_url, &eff_path, &headers, outbound_body, &slots, &state.failover, &state.quotas,
     ).await else {
-        eprintln!("[aphelion] upstream connection error on {}", redact_path_query(&path_and_query));
+        eprintln!("[aphelion] upstream connection error on {}", redact_path_query(&eff_path));
         return Ok(static_resp(StatusCode::BAD_GATEWAY, "text/plain", "upstream connection failed".to_owned()));
     };
     let (upstream_res, bridged) = (disp.response, disp.bridged_oai_to_anthropic);

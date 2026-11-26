@@ -1,5 +1,6 @@
 use crate::harness_io::{
-    activate_config, backup_path, deactivate_config, read_configured_url, ConfigFormat,
+    activate_config, backup_path, deactivate_config, default_harness_routes_path,
+    read_configured_url, save_harness_route_to, ConfigFormat,
 };
 use crate::spawn::user_home_dir;
 use serde::{Deserialize, Serialize};
@@ -149,23 +150,23 @@ fn resolve_paths(home: &Path, id: &str) -> (PathBuf, bool) {
     }
 }
 
-fn effective_url(proxy_base: &str, use_v1: bool) -> String {
+fn effective_url(proxy_base: &str, id: &str, use_v1: bool) -> String {
     let base = proxy_base.trim().trim_end_matches('/');
-    if use_v1 { format!("{base}/v1") } else { base.to_owned() }
+    if use_v1 { format!("{base}/h/{id}/v1") } else { format!("{base}/h/{id}") }
 }
 
-fn is_local_aphelion(url: &str, expected: &str) -> bool {
+fn is_local_aphelion(url: &str, proxy_base: &str) -> bool {
     let norm = url.trim().trim_end_matches('/');
-    let e_norm = expected.trim().trim_end_matches('/');
-    let alt = e_norm.replace("127.0.0.1", "localhost");
-    norm.eq_ignore_ascii_case(e_norm) || norm.eq_ignore_ascii_case(&alt)
+    let p_norm = proxy_base.trim().trim_end_matches('/');
+    let alt = p_norm.replace("127.0.0.1", "localhost");
+    norm.to_ascii_lowercase().starts_with(&p_norm.to_ascii_lowercase())
+        || norm.to_ascii_lowercase().starts_with(&alt.to_ascii_lowercase())
 }
 
 fn build_status(home: &Path, spec: &HarnessSpec, proxy_base: &str) -> IntegrationStatus {
     let (path, detected) = resolve_paths(home, spec.id);
-    let expected = effective_url(proxy_base, spec.use_v1);
     let current_url = read_configured_url(&path, spec.fmt);
-    let active = current_url.as_deref().is_some_and(|u| is_local_aphelion(u, &expected));
+    let active = current_url.as_deref().is_some_and(|u| is_local_aphelion(u, proxy_base));
     let can_restore = !matches!(spec.fmt, ConfigFormat::ReadOnlyDir) && backup_path(&path).exists();
     IntegrationStatus {
         id: spec.id.to_owned(),
@@ -196,10 +197,15 @@ pub fn activate_integration(id: &str, proxy_base: &str) -> Result<IntegrationSta
 }
 
 pub fn activate_integration_in(home: &Path, id: &str, proxy_base: &str) -> Result<IntegrationStatus, String> {
-    let spec = HARNESSES.iter().find(|s| s.id == id)
-        .ok_or_else(|| format!("unsupported integration `{id}`"))?;
+    let spec = HARNESSES.iter().find(|s| s.id == id).ok_or_else(|| format!("unsupported integration `{id}`"))?;
     let (path, _) = resolve_paths(home, id);
-    let url = effective_url(proxy_base, spec.use_v1);
+    let orig = read_configured_url(&path, spec.fmt)
+        .filter(|u| !is_local_aphelion(u, proxy_base))
+        .or_else(|| read_configured_url(&backup_path(&path), spec.fmt).filter(|u| !is_local_aphelion(u, proxy_base)));
+    if let Some(orig_url) = orig {
+        let _ = save_harness_route_to(&default_harness_routes_path(home), id, &orig_url);
+    }
+    let url = effective_url(proxy_base, id, spec.use_v1);
     activate_config(&path, spec.fmt, &url)?;
     Ok(build_status(home, spec, proxy_base))
 }

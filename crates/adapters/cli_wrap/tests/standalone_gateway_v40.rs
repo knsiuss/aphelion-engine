@@ -213,7 +213,7 @@ fn ide_activator_backs_up_activates_and_restores_claude_settings_safely() {
     assert!(st1.active);
     assert!(st1.can_restore);
     let updated: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-    assert_eq!(updated["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18789");
+    assert_eq!(updated["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18789/h/claude_code");
     assert_eq!(updated["enabledPlugins"]["my-plugin"], true);
 
     let st2 = deactivate_integration_in(&tmp_home, "claude_code", "http://127.0.0.1:18789").unwrap();
