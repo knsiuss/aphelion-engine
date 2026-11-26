@@ -20,6 +20,7 @@ pub mod optical_history;
 pub mod output_opt;
 pub mod patcher;
 pub mod prefix_ledger;
+pub mod pricing;
 pub mod rtk_chain;
 pub mod rtk_filters;
 pub mod sse_bridge;

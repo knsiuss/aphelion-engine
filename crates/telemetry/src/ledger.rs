@@ -22,6 +22,19 @@ impl Default for PricingRates {
     }
 }
 
+impl PricingRates {
+    pub fn for_model(provider: &str, model: &str) -> Self {
+        let p = aphelion_core::pricing::resolve_model_pricing(provider, model);
+        Self {
+            input_per_m: p.input_per_m,
+            output_per_m: p.output_per_m,
+            cache_write_mult: p.cache_write_mult,
+            cache_read_mult: p.cache_read_mult,
+            local_slm_per_m: 0.03,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnTelemetry {
     pub raw_input_tokens: usize,

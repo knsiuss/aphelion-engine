@@ -62,7 +62,7 @@ pub fn parse_duration_ms(spec: &str) -> Option<i64> {
     val.checked_mul(mult)
 }
 
-/// Computes asymmetric net USD saved for a single turn (cached 0.1x vs uncached 1.0x).
+/// Computes asymmetric net USD saved for a single turn using default Claude Sonnet rates.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_turn_net_saved_usd(
     turn_index: usize,
@@ -74,10 +74,42 @@ pub fn compute_turn_net_saved_usd(
     output_tokens: usize,
     c_eff_usd: f64,
 ) -> f64 {
-    let uncached_rate = 3.0 / 1_000_000.0;
-    let cache_read_rate = 0.10 * uncached_rate;
-    let cache_write_rate = 1.25 * uncached_rate;
-    let output_rate = 15.0 / 1_000_000.0;
+    compute_turn_net_saved_usd_for_model(
+        "anthropic",
+        "claude-sonnet",
+        turn_index,
+        raw_tokens,
+        opt_tokens,
+        uncached_input_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        output_tokens,
+        c_eff_usd,
+    )
+}
+
+/// Computes asymmetric net USD saved for a single turn using real per-model input/output/cache pricing.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_turn_net_saved_usd_for_model(
+    provider: &str,
+    model: &str,
+    turn_index: usize,
+    raw_tokens: usize,
+    opt_tokens: usize,
+    uncached_input_tokens: usize,
+    cache_read_tokens: usize,
+    cache_creation_tokens: usize,
+    output_tokens: usize,
+    c_eff_usd: f64,
+) -> f64 {
+    let rates = crate::pricing::resolve_model_pricing(provider, model);
+    if rates.input_per_m <= 0.0 && rates.output_per_m <= 0.0 {
+        return 0.0;
+    }
+    let uncached_rate = rates.input_per_m / 1_000_000.0;
+    let cache_read_rate = rates.cache_read_mult * uncached_rate;
+    let cache_write_rate = rates.cache_write_mult * uncached_rate;
+    let output_rate = rates.output_per_m / 1_000_000.0;
 
     let actual_uncached = if uncached_input_tokens > 0 || cache_read_tokens > 0 {
         uncached_input_tokens

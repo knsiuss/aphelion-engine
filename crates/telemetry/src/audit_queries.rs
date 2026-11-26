@@ -1,8 +1,9 @@
 use crate::audit::AuditRecord;
 use crate::prefix_store::AuditSummary;
 use aphelion_core::flight_recorder::{
-    compute_turn_net_saved_usd, normalize_provider_label, AuditFilter, ProviderModelStats,
+    compute_turn_net_saved_usd_for_model, normalize_provider_label, AuditFilter, ProviderModelStats,
 };
+use aphelion_core::pricing::resolve_model_pricing;
 use rusqlite::{Connection, Row};
 use std::collections::{BTreeMap, HashSet};
 
@@ -119,10 +120,6 @@ pub fn apply_filter<'a>(records: &'a [AuditRecord], filter: &AuditFilter) -> Vec
 
 pub fn summarize_records(records: &[&AuditRecord]) -> AuditSummary {
     let mut sum = AuditSummary::default();
-    let uncached_rate = 3.0 / 1_000_000.0;
-    let cache_read_rate = 0.10 * uncached_rate;
-    let cache_write_rate = 1.25 * uncached_rate;
-    let output_rate = 15.0 / 1_000_000.0;
 
     for r in records {
         sum.total_requests += 1;
@@ -143,6 +140,15 @@ pub fn summarize_records(records: &[&AuditRecord]) -> AuditSummary {
             sum.total_compactions += 1;
             sum.total_compaction_reclaimed_tokens += r.compaction_tokens_reclaimed;
         }
+        let rates = resolve_model_pricing(&r.provider, &r.model);
+        if rates.input_per_m <= 0.0 && rates.output_per_m <= 0.0 {
+            continue;
+        }
+        let uncached_rate = rates.input_per_m / 1_000_000.0;
+        let cache_read_rate = rates.cache_read_mult * uncached_rate;
+        let cache_write_rate = rates.cache_write_mult * uncached_rate;
+        let output_rate = rates.output_per_m / 1_000_000.0;
+
         let actual_uncached = if r.uncached_input_tokens > 0 || r.cache_read_tokens > 0 {
             r.uncached_input_tokens
         } else {
@@ -196,20 +202,18 @@ pub fn group_by_provider_model(records: &[&AuditRecord]) -> Vec<ProviderModelSta
         entry.ingress_tokens_saved += r
             .ingress_tokens_saved
             .max(r.raw_tokens.saturating_sub(r.opt_tokens));
-        let net = if r.net_saved_usd != 0.0 {
-            r.net_saved_usd
-        } else {
-            compute_turn_net_saved_usd(
-                r.turn_index,
-                r.raw_tokens,
-                r.opt_tokens,
-                r.uncached_input_tokens,
-                r.cache_read_tokens,
-                r.cache_creation_tokens,
-                r.output_tokens,
-                r.c_eff_usd,
-            )
-        };
+        let net = compute_turn_net_saved_usd_for_model(
+            &r.provider,
+            &r.model,
+            r.turn_index,
+            r.raw_tokens,
+            r.opt_tokens,
+            r.uncached_input_tokens,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+            r.output_tokens,
+            r.c_eff_usd,
+        );
         entry.net_saved_usd += net;
     }
     let mut list: Vec<ProviderModelStats> = map.into_values().collect();

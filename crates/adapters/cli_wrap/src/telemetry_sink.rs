@@ -1,7 +1,7 @@
 use crate::headers::extract_model;
 use crate::proxy::ProxyState;
 use crate::ui_state::TelemetryEvent;
-use aphelion_core::flight_recorder::{compute_turn_net_saved_usd, normalize_provider_label};
+use aphelion_core::flight_recorder::{compute_turn_net_saved_usd_for_model, normalize_provider_label};
 use aphelion_core::types::{ExecutionProfile, RequestOptions, SlmRouteDecision, UpstreamUsage};
 use aphelion_telemetry::audit::AuditRecord;
 use aphelion_telemetry::bpe::count_payload_tokens;
@@ -160,7 +160,7 @@ pub fn finalize_turn(
         action_output_tokens: u.output_tokens.saturating_sub(u.reasoning_tokens),
         ..TurnTelemetry::default()
     };
-    let rates = PricingRates::default();
+    let rates = PricingRates::for_model(&turn.provider, &turn.model);
     let c_eff = tel.effective_cost_usd(rates);
     if let Ok(mut sum) = state.summary.lock() {
         sum.record(&tel, rates);
@@ -171,9 +171,9 @@ pub fn finalize_turn(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let ingress_saved = turn.ingress_saved_tokens.max(turn.raw_tokens.saturating_sub(turn.opt_tokens));
-    let net_saved_usd = compute_turn_net_saved_usd(
-        turn.turn_index, turn.raw_tokens, turn.opt_tokens, uncached, cache_read,
-        u.cache_creation_tokens, u.output_tokens, c_eff,
+    let net_saved_usd = compute_turn_net_saved_usd_for_model(
+        &turn.provider, &turn.model, turn.turn_index, turn.raw_tokens, turn.opt_tokens,
+        uncached, cache_read, u.cache_creation_tokens, u.output_tokens, c_eff,
     );
     let denom = cache_read + uncached + u.cache_creation_tokens;
     let cache_hit_pct = if denom == 0 { 0.0 } else { (cache_read as f64 * 100.0) / (denom as f64) };
